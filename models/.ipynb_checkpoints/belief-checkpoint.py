@@ -1,5 +1,5 @@
 import torch
-import numpy as np
+
 
 class BeliefPropagator:
     def __init__(self, traj_graph, posterior):
@@ -7,50 +7,59 @@ class BeliefPropagator:
         self.posterior = posterior
         self.device = posterior.device
 
-        self.path_ids = posterior.path_ids  # List of (root, leaf) tuples
-        self.n_paths = len(self.path_ids)
+        self.edge_list = traj_graph.edge_list  # [(u_idx, v_idx)]
+        self.n_edges = len(self.edge_list)
+        self.edge_to_index = {
+            (u, v): i for i, (u, v) in enumerate(traj_graph.edge_list)
+        }
+        self.index_to_edge = {i: (u, v) for (u, v), i in self.edge_to_index.items()}
 
-        self.path_to_index = {pid: i for i, pid in enumerate(self.path_ids)}
-        self.index_to_path = {i: pid for i, pid in enumerate(self.path_ids)}
+        self.A = self._build_edge_adjacency()
 
-        self.A = self._build_path_adjacency()
-
-    def _build_path_adjacency(self):
+    def _build_edge_adjacency(self):
         """
-        Builds symmetric adjacency matrix A where A[i,j] = 1 if
-        path_i and path_j share a node in their trajectory.
+        Builds edge adjacency matrix [E, E] where A[i, j] reflects the probability
+        of transitioning from edge i to edge j, based on shared nodes and learned transition weights.
         """
-        A = torch.zeros((self.n_paths, self.n_paths), device=self.device)
+        E = self.n_edges
+        A = torch.zeros((E, E), device=self.device)
 
-        for i, path_i in enumerate(self.path_ids):
-            nodes_i = {u for u, _ in self.posterior.paths[path_i]}
-            nodes_i.add(self.posterior.paths[path_i][-1][1])
+        for i in range(E):
+            u_i, v_i = self.index_to_edge[i]
 
-            for j, path_j in enumerate(self.path_ids):
+            # Always allow self-loop (retain mass)
+            A[i, i] = 1.0
+
+            # Check all other edges j
+            for j in range(E):
                 if i == j:
                     continue
-                nodes_j = {u for u, _ in self.posterior.paths[path_j]}
-                nodes_j.add(self.posterior.paths[path_j][-1][1])
+                u_j, v_j = self.index_to_edge[j]
 
-                if nodes_i & nodes_j:
-                    A[i, j] = 1.0
+                # Edges are connectable if they share a node (v_i == u_j or v_i == v_j)
+                shared = (v_i == u_j or v_i == v_j or u_i == v_j or u_i == u_j)
+                if not shared:
+                    continue
 
-        A = A / (A.sum(dim=1, keepdim=True) + 1e-8)  # Row-normalize
+                # Look up transition probability A((v_i, v_j)) = B / Z
+                # Only valid if there's an actual trajectory edge between v_i → v_j
+                if (v_i, v_j) in self.traj.branch_probabilities:
+                    B_val = self.traj.branch_probabilities[(v_i, v_j)]
+                    Z_val = self.traj.normalizing_constants.get(v_i, 1.0)
+                    A_prob = B_val / (Z_val + 1e-8)
+                    A[i, j] = A_prob
+
+        # Normalize rows so they sum to 1
+        A = A / (A.sum(dim=1, keepdim=True) + 1e-8)
         return A
 
-    def diffuse(self, q_p, alpha=0.5, steps=1):
+    def diffuse(self, q_edge, alpha=0.5, steps=1):
         """
-        Diffuse q_p: [N, P] over path topology.
-
-        Args:
-            q_p: tensor of shape [N, P], base categorical distribution
-            alpha: retention strength
-            steps: number of diffusion steps
-
-        Returns:
-            q_eff: diffused posterior [N, P]
+        Diffuse edge-level probabilities q_edge: [N, E] using adjacency A.
+        alpha: retention factor.
+        Returns q_eff: [N, E]
         """
-        q_eff = q_p.clone()
+        q_eff = q_edge.clone()
         for _ in range(steps):
-            q_eff = alpha * q_p + (1 - alpha) * (q_eff @ self.A)
+            q_eff = alpha * q_edge + (1 - alpha) * (q_eff @ self.A)
         return q_eff

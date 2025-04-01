@@ -151,7 +151,8 @@ class TrajectoryGraph:
         X = np.asarray(self.adata.X)
         cell_to_index = {cell: idx for idx, cell in enumerate(self.adata.obs_names)}
         node_expr = {node: [] for node in self.G_traj.nodes()}
-
+    
+        # Aggregate expression for each node
         for edge in self.G_traj.edges():
             df = cell_assignment[cell_assignment['edge'] == edge]
             if df.empty:
@@ -160,12 +161,14 @@ class TrajectoryGraph:
                 expr = X[cell_to_index[cell]]
                 node_expr[edge[0]].append(expr)
                 node_expr[edge[1]].append(expr)
-
+    
+        # Compute mean expression per node
         self.node_emission = {
             node: np.mean(expr_list, axis=0) if expr_list else np.zeros(X.shape[1])
             for node, expr_list in node_expr.items()
         }
-
+    
+        # Initialize edge-specific variance (r²), dropout (pi), and K
         emission_params = {}
         for edge in self.G_traj.edges():
             df = cell_assignment[cell_assignment['edge'] == edge]
@@ -176,13 +179,16 @@ class TrajectoryGraph:
                 expr_edge = np.array([X[cell_to_index[cell]] for cell in df.index])
                 var_expr = np.var(expr_edge, axis=0)
                 pi_val = np.mean(expr_edge == 0, axis=0)
-            g_a = self.node_emission.get(edge[0], np.zeros(X.shape[1]))
-            g_b = self.node_emission.get(edge[1], np.zeros(X.shape[1]))
-            K = np.ones_like(g_a)
-            emission_params[edge] = {'g_a': g_a, 'g_b': g_b, 'K': K, 'r2': var_expr, 'pi': pi_val}
-
+            K = np.ones_like(var_expr)
+            emission_params[edge] = {
+                'K': K,
+                'r2': var_expr,
+                'pi': pi_val
+            }
+    
         self.emission_params = emission_params
         return emission_params
+
 
     def plot_cells_on_trajectory(self, cell_assignment, **kwargs):
         plot_cells_on_trajectory(self.G_traj, cell_assignment, self.adata, branch_probs=self.branch_probabilities, **kwargs)

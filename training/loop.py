@@ -6,7 +6,7 @@ from utils.inference import batch_indices
 
 def train_model(
     X, traj_graph, posterior, belief_propagator,
-    g_a, g_b, K, log_sigma2, pi, edge_to_index,
+    g, K, log_sigma2, pi, edge_to_index,
     use_lagging=False,
     minibatch=False,
     batch_size=512,
@@ -18,20 +18,25 @@ def train_model(
     kl_weight=1.0,
     kl_p_weight=1.0,
     t_cont_weight=1.0,
+    transition_weight=1.0,
+    l1_weight=0.0,
     lr=1e-2
 ):
+    node_params = [g, K, log_sigma2]
+
     if use_lagging:
         optimizer_inf = torch.optim.Adam(
-            [posterior.alpha, posterior.beta, posterior.path_logits], lr=lr)
-        optimizer_gen = torch.optim.Adam([g_a, g_b, K, log_sigma2], lr=lr)
+            [posterior.alpha, posterior.beta, posterior.edge_logits, posterior.B_logits], lr=lr)
+        optimizer_gen = torch.optim.Adam(node_params, lr=lr)
     else:
-        params = [posterior.alpha, posterior.beta, posterior.path_logits, g_a, g_b, K, log_sigma2]
+        params = [posterior.alpha, posterior.beta, posterior.edge_logits, posterior.B_logits] + node_params
         optimizer = torch.optim.Adam(params, lr=lr)
 
+    emissions_frozen = False
     for epoch in range(num_epochs):
         start = time.time()
+
         if use_lagging:
-            # === Inference step ===
             for _ in range(inference_steps):
                 optimizer_inf.zero_grad()
                 loss = 0.0
@@ -39,19 +44,19 @@ def train_model(
                     X_batch = X[batch]
                     elbo, _ = compute_elbo_batch(
                         X_batch, batch, traj_graph, posterior, edge_to_index,
-                        g_a, g_b, K, log_sigma2.exp(),
+                        g, K, log_sigma2.exp(), pi=pi,
                         belief_propagator=belief_propagator,
-                        pi=pi,
                         n_samples=n_samples,
                         kl_weight=kl_weight,
                         kl_p_weight=kl_p_weight,
-                        t_cont_weight=t_cont_weight
+                        t_cont_weight=t_cont_weight,
+                        transition_weight=transition_weight,
+                        l1_weight=l1_weight
                     )
                     elbo.backward()
                     loss += elbo.item()
                 optimizer_inf.step()
 
-            # === Generative step ===
             for _ in range(generative_steps):
                 optimizer_gen.zero_grad()
                 loss = 0.0
@@ -59,38 +64,43 @@ def train_model(
                     X_batch = X[batch]
                     elbo, _ = compute_elbo_batch(
                         X_batch, batch, traj_graph, posterior, edge_to_index,
-                        g_a, g_b, K, log_sigma2.exp(),
+                        g, K, log_sigma2.exp(), pi=pi,
                         belief_propagator=belief_propagator,
-                        pi=pi,
                         n_samples=n_samples,
                         kl_weight=kl_weight,
                         kl_p_weight=kl_p_weight,
-                        t_cont_weight=t_cont_weight
+                        t_cont_weight=t_cont_weight,
+                        transition_weight=transition_weight,
+                        l1_weight=l1_weight
                     )
                     elbo.backward()
                     loss += elbo.item()
                 optimizer_gen.step()
+
         else:
-            # Standard training (joint inference/generative)
             optimizer.zero_grad()
             elbo, metrics = compute_elbo(
-                X, traj_graph, posterior, edge_to_index,
-                g_a, g_b, K, log_sigma2.exp(), pi=pi,
+                X, torch.arange(X.shape[0]), traj_graph, posterior, edge_to_index,
+                g, K, log_sigma2.exp(), pi=pi,
                 belief_propagator=belief_propagator,
                 n_samples=n_samples,
                 kl_weight=kl_weight,
                 kl_p_weight=kl_p_weight,
-                t_cont_weight=t_cont_weight
+                t_cont_weight=t_cont_weight,
+                transition_weight=transition_weight,
+                l1_weight=l1_weight
             )
             elbo.backward()
 
-            # Freeze emissions during curriculum phase
-            if epoch < freeze_epochs:
-                for p in [g_a, g_b, K, log_sigma2]:
+            if epoch == 0 and not emissions_frozen:
+                for p in node_params:
                     p.requires_grad_(False)
-            else:
-                for p in [g_a, g_b, K, log_sigma2]:
+                emissions_frozen = True
+
+            elif epoch == freeze_epochs and emissions_frozen:
+                for p in node_params:
                     p.requires_grad_(True)
+                emissions_frozen = False
 
             optimizer.step()
             _log_stats(epoch, elbo.item(), metrics, time.time() - start)
@@ -103,10 +113,12 @@ def _get_batches(X, batch_size):
 
 def _log_stats(epoch, loss, metrics, elapsed):
     print(f"[Epoch {epoch}] Loss: {loss:.3e}")
-    print(f"  NLL:      {metrics['nll']:.3e}")
-    print(f"  KL(t):    {metrics['kl_t']:.3f}")
-    print(f"  KL(p):    {metrics['kl_p']:.3f}")
-    print(f"  t_cont:   {metrics['t_cont']:.3f}")
-    entropy = -(metrics["q_eff"] * metrics["q_eff"].clamp(min=1e-6).log()).sum(dim=1).mean()
-    print(f"  Entropy:  {entropy:.3f}")
-    print(f"  Time:     {elapsed:.2f}s")
+    print(f"  NLL:        {metrics['nll']:.3e}")
+    print(f"  KL(t):      {metrics['kl_t']:.3f}")
+    print(f"  KL(p):      {metrics['kl_p']:.3f}")
+    print(f"  t_cont:     {metrics['t_cont']:.3f}")
+    print(f"  Transition: {metrics.get('transition', 0.0):.3f}")
+    print(f"  L1 Δg:      {metrics.get('l1', 0.0):.3f}")
+    entropy = -(metrics["q_eff"] * metrics["q_eff"].clamp(min=1e-6).log()).sum(dim=1).mean().item()
+    print(f"  Entropy:    {entropy:.3f}")
+    print(f"  Time:       {elapsed:.2f}s")
