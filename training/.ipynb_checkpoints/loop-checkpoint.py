@@ -26,21 +26,27 @@ def train_model(
 
     if use_lagging:
         optimizer_inf = torch.optim.Adam(
-            [posterior.alpha, posterior.beta, posterior.edge_logits, posterior.B_logits], lr=lr)
+            [posterior.alpha, posterior.beta, posterior.edge_logits, posterior.branch_logits],
+            lr=lr
+        )
         optimizer_gen = torch.optim.Adam(node_params, lr=lr)
     else:
-        params = [posterior.alpha, posterior.beta, posterior.edge_logits, posterior.B_logits] + node_params
-        optimizer = torch.optim.Adam(params, lr=lr)
+        optimizer = torch.optim.Adam(
+            [posterior.alpha, posterior.beta, posterior.edge_logits, posterior.branch_logits] + node_params,
+            lr=lr
+        )
 
     emissions_frozen = False
+
     for epoch in range(num_epochs):
-        start = time.time()
+        start_time = time.time()
 
         if use_lagging:
             for _ in range(inference_steps):
                 optimizer_inf.zero_grad()
-                loss = 0.0
-                for batch in _get_batches(X, batch_size) if minibatch else [torch.arange(X.shape[0])]:
+                total_loss = 0.0
+
+                for batch in _get_batches(X, batch_size) if minibatch else [torch.arange(X.shape[0], device=X.device)]:
                     X_batch = X[batch]
                     elbo, _ = compute_elbo_batch(
                         X_batch, batch, traj_graph, posterior, edge_to_index,
@@ -54,13 +60,15 @@ def train_model(
                         l1_weight=l1_weight
                     )
                     elbo.backward()
-                    loss += elbo.item()
+                    total_loss += elbo.detach()
+
                 optimizer_inf.step()
 
             for _ in range(generative_steps):
                 optimizer_gen.zero_grad()
-                loss = 0.0
-                for batch in _get_batches(X, batch_size) if minibatch else [torch.arange(X.shape[0])]:
+                total_loss = 0.0
+
+                for batch in _get_batches(X, batch_size) if minibatch else [torch.arange(X.shape[0], device=X.device)]:
                     X_batch = X[batch]
                     elbo, _ = compute_elbo_batch(
                         X_batch, batch, traj_graph, posterior, edge_to_index,
@@ -74,13 +82,16 @@ def train_model(
                         l1_weight=l1_weight
                     )
                     elbo.backward()
-                    loss += elbo.item()
+                    total_loss += elbo.detach()
+
                 optimizer_gen.step()
 
         else:
             optimizer.zero_grad()
+
+            cell_indices = torch.arange(X.shape[0], device=X.device)
             elbo, metrics = compute_elbo(
-                X, torch.arange(X.shape[0]), traj_graph, posterior, edge_to_index,
+                X, cell_indices, traj_graph, posterior, edge_to_index,
                 g, K, log_sigma2.exp(), pi=pi,
                 belief_propagator=belief_propagator,
                 n_samples=n_samples,
@@ -103,7 +114,7 @@ def train_model(
                 emissions_frozen = False
 
             optimizer.step()
-            _log_stats(epoch, elbo.item(), metrics, time.time() - start)
+            _log_stats(epoch, elbo.detach().item(), metrics, time.time() - start_time)
 
 
 def _get_batches(X, batch_size):
@@ -112,6 +123,9 @@ def _get_batches(X, batch_size):
 
 
 def _log_stats(epoch, loss, metrics, elapsed):
+    q_eff = metrics["q_eff"].detach()
+    entropy = -(q_eff * q_eff.clamp(min=1e-6).log()).sum(dim=1).mean().item()
+
     print(f"[Epoch {epoch}] Loss: {loss:.3e}")
     print(f"  NLL:        {metrics['nll']:.3e}")
     print(f"  KL(t):      {metrics['kl_t']:.3f}")
@@ -119,6 +133,5 @@ def _log_stats(epoch, loss, metrics, elapsed):
     print(f"  t_cont:     {metrics['t_cont']:.3f}")
     print(f"  Transition: {metrics.get('transition', 0.0):.3f}")
     print(f"  L1 Δg:      {metrics.get('l1', 0.0):.3f}")
-    entropy = -(metrics["q_eff"] * metrics["q_eff"].clamp(min=1e-6).log()).sum(dim=1).mean().item()
     print(f"  Entropy:    {entropy:.3f}")
     print(f"  Time:       {elapsed:.2f}s")

@@ -1,78 +1,46 @@
-import torch
 import numpy as np
+import torch
+import math
 
 
 def pack_emission_params(traj, device='cpu'):
-    edge_to_index = {}
-    index_to_edge = {}
     name_to_index = traj.node_to_index
     index_to_name = {v: k for k, v in name_to_index.items()}
-
-    edge_list = []
-    for i, (u_idx, v_idx) in enumerate(traj.edge_list):
-        u_name = index_to_name[u_idx]
-        v_name = index_to_name[v_idx]
-        edge = (u_name, v_name)
-        edge_to_index[edge] = i
-        index_to_edge[i] = edge
-        edge_list.append(edge)
+    edge_list = traj.edge_list
+    edge_to_index = {edge: i for i, edge in enumerate(edge_list)}
+    index_to_edge = {i: edge for edge, i in edge_to_index.items()}
 
     G = next(iter(traj.node_emission.values())).shape[0]  # genes
     E = len(edge_list)
 
-    # Node-based g_v vector
-    g_node = torch.zeros(len(traj.node_to_index), G)
-    missing_nodes = [
-        node for node in traj.node_to_index
-        if node not in traj.node_emission
-    ]
-    if missing_nodes:
-        print("Missing emission vectors for nodes:", missing_nodes)
-    assert not missing_nodes, f"Missing emission vectors for nodes: {missing_nodes}"
+    g_node = torch.zeros(len(name_to_index), G, device=device)
 
-    
     for node, vec in traj.node_emission.items():
-        g_node[traj.node_to_index[node]] = torch.tensor(vec)
+        g_node[name_to_index[node]] = torch.as_tensor(vec, dtype=torch.float32, device=device)
 
-    missing_nodes = [
-        node for node in traj.node_to_index
-        if node not in traj.node_emission
-    ]
-    assert not missing_nodes, f"Missing emission vectors for nodes: {missing_nodes}"
+    g_a = torch.zeros(E, G, device=device)
+    g_b = torch.zeros(E, G, device=device)
+    K = torch.ones(E, G, device=device)
+    sigma2 = torch.ones(E, G, device=device)
+    pi = torch.zeros(E, G, device=device)
 
-    g_a = torch.zeros(E, G)
-    g_b = torch.zeros(E, G)
-    K = torch.ones(E, G)
-    sigma2 = torch.ones(E, G)
-    pi = torch.zeros(E, G)
-
-    for (u_name, v_name), i in edge_to_index.items():
-        params = traj.emission_params.get((u_name, v_name), None)
+    for (u, v), i in edge_to_index.items():
+        params = traj.emission_params.get((u, v), None)
         if params is None:
-            raise KeyError(f"Missing emission params for edge: ({u_name}, {v_name})")
-        u_idx = traj.node_to_index[u_name]
-        v_idx = traj.node_to_index[v_name]
+            raise KeyError(f"Missing emission params for edge: ({u}, {v})")
+        u_idx = name_to_index[u]
+        v_idx = name_to_index[v]
         g_a[i] = g_node[u_idx]
         g_b[i] = g_node[v_idx]
-        K[i] = torch.tensor(params['K'])
-        sigma2[i] = torch.tensor(params['r2'])
-        pi[i] = torch.tensor(params['pi'])
+        K[i] = torch.as_tensor(params['K'], dtype=torch.float32, device=device)
+        sigma2[i] = torch.as_tensor(params['r2'], dtype=torch.float32, device=device)
+        pi[i] = torch.as_tensor(params['pi'], dtype=torch.float32, device=device)
 
-    return edge_to_index, g_a.to(device), g_b.to(device), K.to(device), sigma2.to(device), pi.to(device), g_node.to(device)
+    return edge_to_index, g_a, g_b, K, sigma2, pi, g_node
+
 
 
 def emission_nll(X, P_idx, T, g, K, sigma2, index_to_edge, node_to_index, pi=None):
-    # Move everything to CPU for safe debugging
-    X = X.cpu()
-    P_idx = P_idx.cpu()
-    T = T.cpu()
-    g = g.cpu()
-    K = K.cpu()
-    sigma2 = sigma2.cpu()
-    if pi is not None:
-        pi = pi.cpu()
-    device = torch.device("cpu")
-
     """
     Args:
         X: [B, G] observed gene expression
@@ -80,45 +48,34 @@ def emission_nll(X, P_idx, T, g, K, sigma2, index_to_edge, node_to_index, pi=Non
         T: [B] latent time values in [0,1]
         g: [n_nodes, G] node-level expression parameters
         K, sigma2, pi: [n_edges, G] emission parameters per edge
-        index_to_edge: dict[int → (u_idx, v_idx)]
+        index_to_edge: dict[int → (u_name, v_name)]
+        node_to_index: dict[u_name → int]
     """
     device = X.device
+    P_idx = P_idx.long()
 
-    try:
-        p_values = [int(i) for i in P_idx.cpu()]
-        # print("P_idx shape:", P_idx.shape)
-        # print("P_idx values:", p_values)
-        # print("Max valid index:", max(index_to_edge.keys()))
-    
-        invalid = [i for i in p_values if i < 0 or i >= len(index_to_edge)]
-        if invalid:
-            raise ValueError(f"Invalid indices in P_idx: {invalid}")
-    except Exception as e:
-        print("Exception while inspecting P_idx:", e)
-        raise
+    # Convert index_to_edge into vectorized u/v lookup
+    uv_pairs = [index_to_edge[i.item()] for i in P_idx]
+    u_idx = torch.tensor([node_to_index[u] for u, _ in uv_pairs], device=device)
+    v_idx = torch.tensor([node_to_index[v] for _, v in uv_pairs], device=device)
 
-
-    u_indices = torch.tensor([node_to_index[index_to_edge[i][0]] for i in p_values], device=device)
-    v_indices = torch.tensor([node_to_index[index_to_edge[i][1]] for i in p_values], device=device)
-
-
-
-    g_a = g[u_indices]
-    g_b = g[v_indices]
+    g_a = g[u_idx]
+    g_b = g[v_idx]
 
     mu = g_b + (g_a - g_b) * torch.exp(-K[P_idx] * T.unsqueeze(-1))
     var = sigma2[P_idx]
     log_var = torch.log(var + 1e-6)
 
-    log_normal = -0.5 * ((X - mu)**2 / (var + 1e-6) + log_var + np.log(2 * np.pi))
+    log_normal = -0.5 * ((X - mu)**2 / (var + 1e-6) + log_var + math.log(2 * math.pi))
 
     if pi is not None:
         pi_vals = pi[P_idx].clamp(min=1e-6, max=1 - 1e-6)
         log_zero = torch.log(pi_vals)
-        log_nonzero = torch.log(1 - pi_vals) + log_normal
+        log_nonzero = torch.log1p(-pi_vals) + log_normal
         log_prob = torch.where(X == 0, log_zero, log_nonzero)
     else:
         log_prob = log_normal
 
     return -log_prob.sum(dim=1).mean()
+
 

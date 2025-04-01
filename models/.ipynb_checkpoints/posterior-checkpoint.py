@@ -1,116 +1,128 @@
 import torch
-import numpy as np
+import torch.nn as nn
 from torch.distributions import Categorical, Beta
 from collections import defaultdict
 import networkx as nx
 
 
-class TreeVariationalPosterior:
+class TreeVariationalPosterior(nn.Module):
     def __init__(self, traj_graph, n_cells: int, device='cpu'):
+        super().__init__()
         self.traj = traj_graph
         self.device = device
         self.n_cells = n_cells
 
-        self.edge_list = traj_graph.edge_list  # (u_idx, v_idx)
+        self.edge_list = traj_graph.edge_list
         self.n_edges = len(self.edge_list)
 
-        # Variational parameters per cell per edge
-        self.alpha = torch.nn.Parameter(torch.ones(n_cells, self.n_edges, device=device))
-        self.beta = torch.nn.Parameter(torch.ones(n_cells, self.n_edges, device=device))
-        self.edge_logits = torch.nn.Parameter(torch.zeros(n_cells, self.n_edges, device=device))
+        self.alpha = nn.Parameter(torch.ones(n_cells, self.n_edges, device=device))
+        self.beta = nn.Parameter(torch.ones(n_cells, self.n_edges, device=device))
+        self.edge_logits = nn.Parameter(1e-2 * torch.randn(n_cells, self.n_edges, device=device))
+        self.branch_logits = nn.Parameter(torch.zeros(self.n_edges, device=device))
 
-        # Learnable branch logits per edge (for B)
-        self.branch_logits = torch.nn.Parameter(torch.zeros(self.n_edges, device=device))
-
-        # Edge ↔ index mapping
         self.edge_to_index = {(u, v): i for i, (u, v) in enumerate(self.edge_list)}
         self.index_to_edge = {i: (u, v) for (u, v), i in self.edge_to_index.items()}
 
-        # Parent → [children] edge mapping (used in transitions)
         self.children_map = defaultdict(list)
         for (u, v) in self.edge_list:
             self.children_map[u].append((u, v))
 
-    def compute_branch_probs(self):
-        """Compute softmax-normalized branch probabilities B(edge) over children of each node."""
-        B = {}
-        for parent, child_edges in self.children_map.items():
-            logits = torch.stack([self.branch_logits[self.edge_to_index[e]] for e in child_edges])
-            probs = torch.softmax(logits, dim=0)
-            for edge, prob in zip(child_edges, probs):
-                B[edge] = prob
-        return B
+        self.reachable_paths = self._precompute_reachable_paths(self.traj.G_traj)
 
-    def compute_transition_probs(self):
-        """
-        Compute transition probabilities A(sp,t → sq,t′) using learned branch logits.
-        Returns:
-            A_probs: dict mapping (from_edge_idx, to_edge_idx) → A probability
-            Z: dict mapping from_edge_idx → normalization constant
-        """
-        B = self.compute_branch_probs()
-        A_probs = {}
-        Z = {}
+    def _precompute_reachable_paths(self, G_traj):
+        edge_to_index = self.edge_to_index
+        reachable_paths = {}
     
-        G = self.traj.G_traj
-        index_to_name = {v: k for k, v in self.traj.node_to_index.items()}
-        
-        for i, (u_idx, v_idx) in enumerate(self.edge_list):
-            u = index_to_name[u_idx]
-            v = index_to_name[v_idx]
+        for i, (u_name, v_name) in self.index_to_edge.items():
+            reachable_paths[i] = {}
     
-            reachable = []
-            branch_path_weights = {}
-    
-            for j, (x_idx, y_idx) in enumerate(self.edge_list):
-                x = index_to_name[x_idx]
-                y = index_to_name[y_idx]
-    
-                # Check if (x, y) is reachable from v
+            for j, (x_name, _) in self.index_to_edge.items():
                 try:
-                    path_nodes = nx.shortest_path(G, source=v, target=x)
+                    path_nodes = nx.shortest_path(G_traj, source=v_name, target=x_name)
+                    edge_path = [(path_nodes[k], path_nodes[k + 1]) for k in range(len(path_nodes) - 1)]
+                    path_indices = [edge_to_index[edge] for edge in edge_path if edge in edge_to_index]
+    
+                    if len(path_indices) == len(edge_path):
+                        reachable_paths[i][j] = path_indices
                 except (nx.NetworkXNoPath, nx.NodeNotFound):
                     continue
     
-                # Convert to edge path
-                edge_path = [(path_nodes[k], path_nodes[k + 1]) for k in range(len(path_nodes) - 1)]
+        return reachable_paths
+
+
+    def freeze(self):
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+    def unfreeze(self):
+        for p in self.parameters():
+            p.requires_grad_(True)
+
+    def compute_branch_probs(self):
+        B_tensor = torch.zeros_like(self.branch_logits)
     
-                # Compute product of B's along the path
-                product = 1.0
-                for edge in edge_path:
-                    product *= B.get(edge, 1e-8)
+        for parent, child_edges in self.children_map.items():
+            if not child_edges:
+                continue
     
-                branch_path_weights[j] = product
-                reachable.append(j)
+            # Get indices of child edges
+            child_idxs = torch.tensor(
+                [self.edge_to_index[edge] for edge in child_edges],
+                device=self.branch_logits.device
+            )
     
-            # Z_p,t normalization constant: on-edge stay + all transitions
-            z_val = (1 - 0.5) + sum(branch_path_weights.values())  # assume midpoint t = 0.5
+            logits = self.branch_logits[child_idxs]
+            probs = torch.softmax(logits, dim=0)
+    
+            # Use in-place update (preserves graph)
+            B_tensor[child_idxs] = probs
+    
+        return B_tensor
+
+
+    def compute_transition_probs(self):
+        B_tensor = self.compute_branch_probs()
+        A_probs = torch.zeros(self.n_edges, self.n_edges, device=self.device)
+        Z = torch.zeros(self.n_edges, device=self.device)
+
+        active_paths = sum(len(v) for v in self.reachable_paths.values())
+        #print(f"Reachable paths count: {active_paths}")
+
+
+        for i in range(self.n_edges):
+            weights = []
+            targets = []
+
+            for j, path_indices in self.reachable_paths.get(i, {}).items():
+                b_vals = B_tensor[path_indices]
+                weights.append(b_vals.prod())
+                targets.append(j)
+
+            if weights:
+                stacked_weights = torch.stack(weights)
+                z_val = 0.5 + stacked_weights.sum()
+            else:
+                z_val = torch.tensor(0.5, device=self.device)
+
             Z[i] = z_val
-    
-            # Stay on same edge
-            A_probs[(i, i)] = 1.0 / z_val
-    
-            # Cross-edge transitions
-            for j in reachable:
-                if j == i:
-                    continue
-                A_probs[(i, j)] = branch_path_weights[j] / z_val
-    
+            A_probs[i, i] = 1.0 / z_val
+
+            for j, w in zip(targets, weights):
+                if j != i:
+                    A_probs[i, j] = w / z_val
+
         return A_probs, Z
 
-
     def sample(self, cell_idx, n_samples=1):
-        """Sample edge and t ∈ [0,1] from q(S) for a given cell."""
         edge_probs = torch.softmax(self.edge_logits[cell_idx], dim=0)
         edge_dist = Categorical(edge_probs)
-        edge_idx = edge_dist.sample((n_samples,))  # shape: [n_samples]
+        edge_idx = edge_dist.sample((n_samples,))
         alpha = self.alpha[cell_idx, edge_idx]
         beta = self.beta[cell_idx, edge_idx]
         t = Beta(alpha, beta).rsample()
         return edge_idx, t
 
     def log_q(self, cell_idx, edge_idx, t):
-        """Log q(S = (edge_idx, t))"""
         edge_probs = torch.softmax(self.edge_logits[cell_idx], dim=0)
         log_edge_prob = torch.log(edge_probs[edge_idx] + 1e-10)
         alpha = self.alpha[cell_idx, edge_idx]
@@ -119,5 +131,4 @@ class TreeVariationalPosterior:
         return log_edge_prob + log_t_prob
 
     def compute_edge_probs(self):
-        """Return q(edge) for all cells."""
         return torch.softmax(self.edge_logits, dim=1)
