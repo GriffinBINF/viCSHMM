@@ -75,14 +75,15 @@ def compute_elbo(
     device = X.device
     all_nll, all_kl_t, all_trans_logp = [], [], []
 
+    # Compute edge probabilities
     q_e = torch.softmax(posterior.edge_logits[cell_indices], dim=1)
 
-    # Use structure to bias posterior
-    with torch.no_grad():
-        A_prior, _ = posterior.compute_transition_probs()
-    
-    q_e = q_e @ A_prior  # Encourage edge selection via transition structure
+    # Removed structural biasing step
+    # with torch.no_grad():
+    #     A_prior, _ = posterior.compute_transition_probs()
+    # q_e = q_e @ A_prior
 
+    # Optional smoothing
     q_eff = belief_propagator.diffuse(q_e, alpha=0.5, steps=2) if belief_propagator else q_e
 
     index_to_edge = {v: k for k, v in edge_to_index.items()}
@@ -122,21 +123,20 @@ def compute_elbo(
     mean_kl_t = torch.stack(all_kl_t).mean()
     mean_trans = torch.stack(all_trans_logp).mean()
 
+    # Correct KL(q(P_idx|X) || Uniform)
     edge_probs = torch.softmax(posterior.edge_logits, dim=1)[cell_indices]
-    log_prior = torch.log_softmax(posterior.edge_logits, dim=1)[cell_indices]
-    kl_p = (edge_probs * (edge_probs.clamp(min=1e-8).log() - log_prior)).sum(dim=1).mean()
+    n_edges = posterior.n_edges
+    log_uniform_prior = torch.log(torch.tensor(1.0 / n_edges, device=device))
+    kl_p = (edge_probs * (edge_probs.clamp(min=1e-8).log() - log_uniform_prior)).sum(dim=1).mean()
 
     t_cont = continuity_penalty(edge_idx, t, traj, edge_to_index, node_index)
 
-    node_index = traj.node_to_index
     l1 = sum(
         torch.nn.functional.l1_loss(g[node_index[u]], g[node_index[v]], reduction='sum')
         for u, v in traj.edge_list
     )
-
     l1_penalty = l1 / len(traj.edge_list)
 
-    # Emission continuity penalty
     continuity_mse = []
     for (u_name, v_name), i in edge_to_index.items():
         v_idx = node_index[v_name]
@@ -147,20 +147,20 @@ def compute_elbo(
 
     emission_cont = torch.stack(continuity_mse).mean() if continuity_mse else g.new_zeros(1).squeeze()
 
-    # Branch entropy penalty
     B = posterior.compute_branch_probs()
     entropy = - (B * B.clamp(min=1e-8).log()).sum()
 
-    elbo = -mean_nll \
-           - kl_weight * mean_kl_t \
-           - kl_p_weight * kl_p \
-           - t_cont_weight * t_cont \
-           + transition_weight * mean_trans \
-           - l1_weight * l1_penalty \
-           - emission_cont \
-           + branch_entropy_weight * entropy
+    # Final loss = NLL + KL_t + KL_p - log(p(P)) + Regularizers - Entropy
+    loss = mean_nll \
+           + kl_weight * mean_kl_t \
+           + kl_p_weight * kl_p \
+           - transition_weight * mean_trans \
+           + t_cont_weight * t_cont \
+           + l1_weight * l1_penalty \
+           + emission_cont \
+           - branch_entropy_weight * entropy
 
-    return -elbo, {
+    return loss, {
         "nll": mean_nll.detach().item(),
         "kl_t": mean_kl_t.detach().item(),
         "kl_p": kl_p.detach().item(),
@@ -172,5 +172,4 @@ def compute_elbo(
         "t": t.detach(),
         "q_eff": q_eff.detach(),
     }
-
 compute_elbo_batch = compute_elbo
