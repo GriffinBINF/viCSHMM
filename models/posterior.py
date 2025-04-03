@@ -17,7 +17,7 @@ class TreeVariationalPosterior(nn.Module):
 
         self.alpha = nn.Parameter(torch.ones(n_cells, self.n_edges, device=device))
         self.beta = nn.Parameter(torch.ones(n_cells, self.n_edges, device=device))
-        self.edge_logits = nn.Parameter(1e-2 * torch.randn(n_cells, self.n_edges, device=device))
+        self.edge_logits = nn.Parameter(1.0 * torch.randn(n_cells, self.n_edges, device=device))
         self.branch_logits = nn.Parameter(torch.zeros(self.n_edges, device=device))
 
         self.edge_to_index = {(u, v): i for i, (u, v) in enumerate(self.edge_list)}
