@@ -12,7 +12,7 @@ class TreeVariationalPosterior(nn.Module):
         self.device = device
         self.n_cells = n_cells
 
-        self.edge_list = traj_graph.edge_list
+        self.edge_list = traj_graph.edge_list  # index-based (u_idx, v_idx)
         self.n_edges = len(self.edge_list)
 
         self.alpha = nn.Parameter(torch.ones(n_cells, self.n_edges, device=device))
@@ -23,6 +23,8 @@ class TreeVariationalPosterior(nn.Module):
         self.edge_to_index = {(u, v): i for i, (u, v) in enumerate(self.edge_list)}
         self.index_to_edge = {i: (u, v) for (u, v), i in self.edge_to_index.items()}
 
+        self.index_to_name = {v: k for k, v in self.traj.node_to_index.items()}  # for converting idx → name
+
         self.children_map = defaultdict(list)
         for (u, v) in self.edge_list:
             self.children_map[u].append((u, v))
@@ -31,24 +33,33 @@ class TreeVariationalPosterior(nn.Module):
 
     def _precompute_reachable_paths(self, G_traj):
         edge_to_index = self.edge_to_index
+        index_to_edge = self.index_to_edge
+        index_to_name = self.index_to_name
+
         reachable_paths = {}
-    
-        for i, (u_name, v_name) in self.index_to_edge.items():
+
+        for i, (u_idx, v_idx) in index_to_edge.items():
+            u_name = index_to_name[u_idx]
+            v_name = index_to_name[v_idx]
             reachable_paths[i] = {}
-    
-            for j, (x_name, _) in self.index_to_edge.items():
+
+            for j, (x_idx, _) in index_to_edge.items():
+                x_name = index_to_name[x_idx]
                 try:
                     path_nodes = nx.shortest_path(G_traj, source=v_name, target=x_name)
                     edge_path = [(path_nodes[k], path_nodes[k + 1]) for k in range(len(path_nodes) - 1)]
-                    path_indices = [edge_to_index[edge] for edge in edge_path if edge in edge_to_index]
-    
+
+                    path_indices = [
+                        edge_to_index[(self.traj.node_to_index[u], self.traj.node_to_index[v])]
+                        for u, v in edge_path
+                        if (self.traj.node_to_index[u], self.traj.node_to_index[v]) in edge_to_index
+                    ]
                     if len(path_indices) == len(edge_path):
                         reachable_paths[i][j] = path_indices
                 except (nx.NetworkXNoPath, nx.NodeNotFound):
                     continue
-    
-        return reachable_paths
 
+        return reachable_paths
 
     def freeze(self):
         for p in self.parameters():
@@ -60,34 +71,26 @@ class TreeVariationalPosterior(nn.Module):
 
     def compute_branch_probs(self):
         B_tensor = torch.zeros_like(self.branch_logits)
-    
+
         for parent, child_edges in self.children_map.items():
             if not child_edges:
                 continue
-    
-            # Get indices of child edges
+
             child_idxs = torch.tensor(
                 [self.edge_to_index[edge] for edge in child_edges],
                 device=self.branch_logits.device
             )
-    
+
             logits = self.branch_logits[child_idxs]
             probs = torch.softmax(logits, dim=0)
-    
-            # Use in-place update (preserves graph)
             B_tensor[child_idxs] = probs
-    
-        return B_tensor
 
+        return B_tensor
 
     def compute_transition_probs(self):
         B_tensor = self.compute_branch_probs()
         A_probs = torch.zeros(self.n_edges, self.n_edges, device=self.device)
         Z = torch.zeros(self.n_edges, device=self.device)
-
-        active_paths = sum(len(v) for v in self.reachable_paths.values())
-        #print(f"Reachable paths count: {active_paths}")
-
 
         for i in range(self.n_edges):
             weights = []
@@ -99,8 +102,7 @@ class TreeVariationalPosterior(nn.Module):
                 targets.append(j)
 
             if weights:
-                stacked_weights = torch.stack(weights)
-                z_val = 0.5 + stacked_weights.sum()
+                z_val = 0.5 + torch.stack(weights).sum()
             else:
                 z_val = torch.tensor(0.5, device=self.device)
 

@@ -22,18 +22,39 @@ def find_path_index_for_edge(edge, posterior):
     return None
 
 
-def initialize_beta_from_cell_assignment(posterior, cell_assignment, edge_to_index, sharpness=0.01):
+def initialize_beta_from_cell_assignment(
+    posterior,
+    cell_assignment,
+    edge_tuple_to_index,
+    node_to_index,
+    sharpness=0.01
+):
     """
     Initializes posterior Beta distributions from initial cell_assignment (edge, t).
+    Compatible with new (u_idx, v_idx) → edge_idx scheme.
     """
+    # Convert from index tuples to name-based mapping
+    inv_node_map = {v: k for k, v in node_to_index.items()}
+    edge_name_to_index = {
+        (inv_node_map[u_idx], inv_node_map[v_idx]): edge_idx
+        for (u_idx, v_idx), edge_idx in edge_tuple_to_index.items()
+    }
+
     for i, row in enumerate(cell_assignment.itertuples()):
         edge = row.edge
-        t = float(np.clip(row.latent_time, 1e-3, 1 - 1e-3))
-        if edge not in edge_to_index:
+        if edge is None or pd.isna(edge):
             continue
-        edge_idx = edge_to_index[edge]
+
+        edge = canonical_edge(edge)
+        t = float(np.clip(row.latent_time, 1e-3, 1 - 1e-3))
+
+        if edge not in edge_name_to_index:
+            continue
+        edge_idx = edge_name_to_index[edge]
+
         posterior.alpha.data[i, edge_idx] = (1.0 - t) / sharpness
         posterior.beta.data[i, edge_idx] = t / sharpness
+
 
 
 def make_beta_assignment_df(posterior, cell_assignment, sharpness=0.01):
