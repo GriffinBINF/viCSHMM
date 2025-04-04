@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import time
 import numpy as np
 import math # For ceiling division
-from models.loss import compute_elbo_batch # Ensure this is the batch version
+from models.loss import compute_elbo # Ensure this is the batch version
 from models.emission import update_emission_means_variances
 from utils.inference import batch_indices
 from utils.constants import EPSILON # For sigma2 clamping
@@ -18,42 +18,43 @@ def _set_requires_grad(params, value):
 def _log_stats(
     epoch, avg_loss, metrics, elapsed, g, sigma2, K, pi=None,
     training_mode="N/A", phase="N/A", tau=None,
-    kl_weight=1.0, kl_p_weight=1.0, t_cont_weight=0.0,
-    transition_weight=1.0, branch_entropy_weight=1.0
+    kl_weight=1.0, kl_p_weight=1.0, t_cont_weight=0.0, # t_cont_weight is unused but keep signature
+    transition_weight=1.0, # transition_weight is unused but keep signature
+    branch_entropy_weight=1.0
 ):
     """Logs training statistics with both raw and weighted ELBO terms."""
+    # Use the metrics dict from the *last batch* for components breakdown
+    # avg_loss is the epoch average of the total loss
     metrics_detached = {k: v.detach().item() if isinstance(v, torch.Tensor) and v.requires_grad else v for k, v in metrics.items()}
 
-    q_eff = metrics_detached.get("q_eff")
-    q_eff_entropy = 0.0
-    if q_eff is not None and isinstance(q_eff, torch.Tensor):
-        q_eff = q_eff.detach()
-        q_eff_clamped = q_eff.clamp(min=EPSILON)
-        q_eff_entropy = -(q_eff * q_eff_clamped.log()).sum(dim=-1).mean().item()
+    # --- Removed q_eff entropy calculation as q_eff is not returned ---
 
     def fmt_term(name, raw, weight):
         weighted = raw * weight
         return f"{name}: {raw:.4f} * {weight:.1e} = {weighted:.4e}"
 
+    # --- Modified Log String ---
     log_str = (
         f"\n[Epoch {epoch}] Mode: {training_mode}" + (f" | Phase: {phase}" if phase != "N/A" else "") + "\n"
-        f"  Avg. ELBO:  {avg_loss:.4e} (raw loss: {metrics_detached.get('loss', 0.0):.4e})\n"
-        f"  NLL (IS):   {metrics_detached.get('nll_weighted', 0.0):.4e}\n"
+        # Report the averaged loss clearly
+        f"  Avg. Loss (-ELBO): {avg_loss:.4e}\n"
+        # Components from the last batch's metrics dict:
+        f"  NLL (IS):      {metrics_detached.get('nll_weighted', 0.0):.4e}\n"
         f"  {fmt_term('KL(t)', metrics_detached.get('kl_t', 0.0), kl_weight)}\n"
         f"  {fmt_term('KL(p)', metrics_detached.get('kl_p', 0.0), kl_p_weight)}\n"
-        f"  {fmt_term('Transition', metrics_detached.get('transition', 0.0), transition_weight)}\n"
-        f"  {fmt_term('EmissionCont', metrics_detached.get('emission_cont', 0.0), t_cont_weight)}\n"
-        f"  {fmt_term('BranchEntropy', metrics_detached.get('branch_entropy', 0.0), branch_entropy_weight)}\n"
-        f"  q_eff Entr: {q_eff_entropy:.4f}\n"
-        f"  g range:    ({g.min():.2f}, {g.max():.2f}), mean: {g.mean():.2f}\n"
-        f"  σ² range:   ({sigma2.min():.2f}, {sigma2.max():.2f}), mean: {sigma2.mean():.2f}\n"
-        f"  K range:    ({K.min():.2f}, {K.max():.2f}), mean: {K.mean():.2f}"
+        # Only show branch entropy if weight > 0
+        f"  {fmt_term('BranchEntropy', metrics_detached.get('branch_entropy', 0.0), branch_entropy_weight) if branch_entropy_weight > 0 else ''}\n"
+        # --- Removed Transition, EmissionCont, q_eff Entr ---
+        f"  g range:       ({g.min():.2f}, {g.max():.2f}), mean: {g.mean():.2f}\n"
+        f"  σ² range:      ({sigma2.min():.2f}, {sigma2.max():.2f}), mean: {sigma2.mean():.2f}\n"
+        f"  K range:       ({K.min():.2f}, {K.max():.2f}), mean: {K.mean():.2f}"
     )
     if pi is not None:
-        log_str += f"\n  π range:    ({pi.min():.2f}, {pi.max():.2f}), mean: {pi.mean():.2f}"
+        log_str += f"\n  π range:       ({pi.min():.2f}, {pi.max():.2f}), mean: {pi.mean():.2f}"
     if tau is not None:
-        log_str += f"\n  Tau (temp): {tau:.3f}"
-    log_str += f"\n  Time:       {elapsed:.2f}s"
+        # tau is passed to compute_elbo but not currently used there, log it anyway as it was intended
+        log_str += f"\n  Tau (temp):    {tau:.3f}"
+    log_str += f"\n  Time:          {elapsed:.2f}s"
     print(log_str)
 
 
@@ -147,9 +148,15 @@ def train_model(
     epochs_in_current_phase = 0
 
     log_history = {
-        "elbo": [], "loss": [], "nll_weighted": [], "kl_t": [], "kl_p": [],
-        "transition": [], "emission_cont": [], "branch_entropy": [], "q_eff": []
-    }
+            "loss": [],          # Store the main averaged loss here
+            "nll_weighted": [],
+            "kl_t": [],
+            "kl_p": [],
+            "branch_entropy": [],
+            # Optional: Add diagnostics if needed
+            "log_weight_mean": [],
+            "log_weight_std": [],
+        }
 
     print(f"--- Starting Training ---")
     print(f"Mode: {training_mode}, Epochs: {num_epochs}, LR: {lr}, Batch Size: {batch_size}")
@@ -214,14 +221,29 @@ def train_model(
 
                 if current_optimizer:
                     current_optimizer.zero_grad()
-                    loss, metrics = compute_elbo_batch(
-                        X_batch, cell_indices_batch, traj_graph, posterior, edge_tuple_to_index,
-                        g, K, sigma2, belief_propagator, n_samples,
-                        kl_weight, kl_p_weight, t_cont_weight,
-                        transition_weight, l1_weight,
-                        branch_entropy_weight, current_tau,
-                        pi if use_pi else None
-                    )
+                    loss, metrics = compute_elbo(
+                                                X=X_batch,                     # Use keyword args for clarity
+                                                cell_indices=cell_indices_batch,
+                                                traj=traj_graph,
+                                                posterior=posterior,
+                                                edge_tuple_to_index=edge_tuple_to_index,
+                                                g=g,
+                                                K=current_K,
+                                                sigma2=sigma2,
+                                                pi=current_pi,                 # Correctly assign pi
+                                                belief_propagator=belief_propagator, # Correctly assign belief_propagator
+                                                n_samples=n_samples,           # Correctly assign n_samples
+                                                kl_weight=kl_weight,
+                                                kl_p_weight=kl_p_weight,
+                                                branch_entropy_weight=branch_entropy_weight,
+                                                # Pass other relevant weights/params using keywords
+                                                t_cont_weight=t_cont_weight,
+                                                transition_weight=transition_weight,
+                                                l1_weight=l1_weight,
+                                                tau=current_tau
+                                                # proposal_beta_const and proposal_target_temp will use defaults from compute_elbo
+                                                # eps will use default from compute_elbo
+                                            )
                     if torch.isnan(loss): raise ValueError(f"NaN loss detected in joint mode, epoch {epoch}, batch {batch_idx}")
                     loss.backward()
                     if gradient_clip_norm is not None:
@@ -237,14 +259,29 @@ def train_model(
                     for _ in range(generative_steps):
                         optimizer_gen.zero_grad()
                         K = F.softplus(K_raw)
-                        loss_gen, metrics_gen = compute_elbo_batch(
-                            X_batch, cell_indices_batch, traj_graph, posterior, edge_tuple_to_index,
-                            g, K, sigma2, belief_propagator, n_samples,
-                            kl_weight, kl_p_weight, t_cont_weight,
-                            transition_weight, l1_weight,
-                            branch_entropy_weight, current_tau,
-                            pi if use_pi else None
-                        )
+                        loss_gen, metrics_gen = compute_elbo(
+                                                X=X_batch,                     # Use keyword args for clarity
+                                                cell_indices=cell_indices_batch,
+                                                traj=traj_graph,
+                                                posterior=posterior,
+                                                edge_tuple_to_index=edge_tuple_to_index,
+                                                g=g,
+                                                K=current_K,
+                                                sigma2=sigma2,
+                                                pi=current_pi,                 # Correctly assign pi
+                                                belief_propagator=belief_propagator, # Correctly assign belief_propagator
+                                                n_samples=n_samples,           # Correctly assign n_samples
+                                                kl_weight=kl_weight,
+                                                kl_p_weight=kl_p_weight,
+                                                branch_entropy_weight=branch_entropy_weight,
+                                                # Pass other relevant weights/params using keywords
+                                                t_cont_weight=t_cont_weight,
+                                                transition_weight=transition_weight,
+                                                l1_weight=l1_weight,
+                                                tau=current_tau
+                                                # proposal_beta_const and proposal_target_temp will use defaults from compute_elbo
+                                                # eps will use default from compute_elbo
+                                            )
                         if torch.isnan(loss_gen): raise ValueError(f"NaN loss detected in lagging (gen), epoch {epoch}, batch {batch_idx}")
                         loss_gen.backward()
                         if gradient_clip_norm is not None:
@@ -260,14 +297,29 @@ def train_model(
                     pi_detached = pi.detach() if pi is not None else None
                     for _ in range(inference_steps):
                         optimizer_inf.zero_grad()
-                        loss_inf, metrics_inf = compute_elbo_batch(
-                            X_batch, cell_indices_batch, traj_graph, posterior, edge_tuple_to_index,
-                            g, K_detached, sigma2, belief_propagator, n_samples,
-                            kl_weight, kl_p_weight, t_cont_weight,
-                            transition_weight, l1_weight,
-                            branch_entropy_weight, current_tau,
-                            pi_detached
-                        )
+                        loss, metrics = compute_elbo(
+                                                X=X_batch,                     # Use keyword args for clarity
+                                                cell_indices=cell_indices_batch,
+                                                traj=traj_graph,
+                                                posterior=posterior,
+                                                edge_tuple_to_index=edge_tuple_to_index,
+                                                g=g,
+                                                K=current_K,
+                                                sigma2=sigma2,
+                                                pi=current_pi,                 # Correctly assign pi
+                                                belief_propagator=belief_propagator, # Correctly assign belief_propagator
+                                                n_samples=n_samples,           # Correctly assign n_samples
+                                                kl_weight=kl_weight,
+                                                kl_p_weight=kl_p_weight,
+                                                branch_entropy_weight=branch_entropy_weight,
+                                                # Pass other relevant weights/params using keywords
+                                                t_cont_weight=t_cont_weight,
+                                                transition_weight=transition_weight,
+                                                l1_weight=l1_weight,
+                                                tau=current_tau
+                                                # proposal_beta_const and proposal_target_temp will use defaults from compute_elbo
+                                                # eps will use default from compute_elbo
+                                            )
                         if torch.isnan(loss_inf): raise ValueError(f"NaN loss detected in lagging (inf), epoch {epoch}, batch {batch_idx}")
                         loss_inf.backward()
                         if gradient_clip_norm is not None:
@@ -295,14 +347,29 @@ def train_model(
 
                 if phase_optimizer:
                     phase_optimizer.zero_grad()
-                    loss, metrics = compute_elbo_batch(
-                        X_batch, cell_indices_batch, traj_graph, posterior, edge_tuple_to_index,
-                        g, current_K, sigma2, belief_propagator, n_samples,
-                        kl_weight, kl_p_weight, t_cont_weight,
-                        transition_weight, l1_weight,
-                        branch_entropy_weight, current_tau,
-                        current_pi
-                    )
+                    loss, metrics = compute_elbo(
+                                                X=X_batch,                     # Use keyword args for clarity
+                                                cell_indices=cell_indices_batch,
+                                                traj=traj_graph,
+                                                posterior=posterior,
+                                                edge_tuple_to_index=edge_tuple_to_index,
+                                                g=g,
+                                                K=current_K,
+                                                sigma2=sigma2,
+                                                pi=current_pi,                 # Correctly assign pi
+                                                belief_propagator=belief_propagator, # Correctly assign belief_propagator
+                                                n_samples=n_samples,           # Correctly assign n_samples
+                                                kl_weight=kl_weight,
+                                                kl_p_weight=kl_p_weight,
+                                                branch_entropy_weight=branch_entropy_weight,
+                                                # Pass other relevant weights/params using keywords
+                                                t_cont_weight=t_cont_weight,
+                                                transition_weight=transition_weight,
+                                                l1_weight=l1_weight,
+                                                tau=current_tau
+                                                # proposal_beta_const and proposal_target_temp will use defaults from compute_elbo
+                                                # eps will use default from compute_elbo
+                                            )
                     if torch.isnan(loss): raise ValueError(f"NaN loss detected in phase_switching ({current_phase}), epoch {epoch}, batch {batch_idx}")
                     loss.backward()
                     if gradient_clip_norm is not None:
@@ -312,16 +379,21 @@ def train_model(
                     last_batch_metrics = metrics
 
             total_loss_accum += batch_loss
-            for key in epoch_metrics_agg.keys():
-                val = last_batch_metrics.get(key, 0.0)
-                epoch_metrics_agg[key] += val.item() if isinstance(val, torch.Tensor) else val
+            for key in log_history.keys(): # Iterate over the NEW keys in log_history
+             # Get value from the last batch's metrics for this key
+                val = last_batch_metrics.get(key, 0.0) # Default to 0.0 if key not present (e.g., 'loss')
+             # Aggregate only the component terms, not the total loss again
+                if key != 'loss':
+                    epoch_metrics_agg[key] += val # val should already be float from metrics_detached
             total_batches += 1
 
         avg_loss_epoch = total_loss_accum / total_batches if total_batches > 0 else 0.0
-        log_history["elbo"].append(avg_loss_epoch)
+        log_history["loss"].append(avg_loss_epoch) # Use the new key 'loss'
         for key in log_history.keys():
-            if key != "elbo":
-                log_history[key].append(epoch_metrics_agg.get(key, float('nan')) / total_batches if total_batches > 0 else float('nan'))
+            if key != "loss": # Already saved avg_loss_epoch
+                # Use the aggregated sum divided by batches
+                averaged_metric = epoch_metrics_agg.get(key, float('nan')) / total_batches if total_batches > 0 else float('nan')
+                log_history[key].append(averaged_metric)
 
         K_final_epoch = F.softplus(K_raw).detach()
         _log_stats(
