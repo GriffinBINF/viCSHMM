@@ -3,7 +3,6 @@ import pandas as pd
 import networkx as nx
 from viz.trajectory import plot_cells_on_trajectory
 
-
 class TrajectoryGraph:
     def __init__(self, adata, cluster_key='leiden', random_state=0, laplace_h=1.0):
         self.adata = adata
@@ -104,16 +103,15 @@ class TrajectoryGraph:
                 G_traj.add_edge(node_for_cluster[p], node_for_cluster[c], label=str(c))
 
         self.G_traj = G_traj
-        self.branch_probabilities = {(u, v): 1.0 for u, v in G_traj.edges()}
+        self.node_to_index = {node: i for i, node in enumerate(G_traj.nodes())}
+        self.edge_list = [(self.node_to_index[u], self.node_to_index[v]) for u, v in G_traj.edges()]
+        self.branch_probabilities = {e: 1.0 for e in self.edge_list}
 
         max_level = max(levels.values()) if levels else 1
         for node in G_traj.nodes():
             cluster = node.split('_')[-1] if G_traj.nodes[node]['type'] != "root_node" else None
             lvl = levels.get(cluster, 0) if cluster else 0
             G_traj.nodes[node]['t'] = lvl / max_level if max_level > 0 else 0.0
-
-        self.node_to_index = {node: i for i, node in enumerate(G_traj.nodes())}
-        self.edge_list = [(self.node_to_index[u], self.node_to_index[v]) for u, v in G_traj.edges()]
 
     def _initialize_transition_probabilities(self):
         for u in self.G_traj.nodes():
@@ -140,37 +138,43 @@ class TrajectoryGraph:
 
     def assign_cells_to_paths(self, random_state=0):
         rng = np.random.default_rng(random_state)
-        cluster_to_edge = {data['label']: (src, dst) for src, dst, data in self.G_traj.edges(data=True) if 'label' in data}
+        cluster_to_edge = {
+            data['label']: (self.node_to_index[src], self.node_to_index[dst])
+            for src, dst, data in self.G_traj.edges(data=True) if 'label' in data
+        }
 
         assignments = pd.DataFrame(index=self.adata.obs_names)
-        assignments['edge'] = self.adata.obs[self.cluster_key].astype(str).map(cluster_to_edge)
+        cluster_labels = self.adata.obs[self.cluster_key].astype(str)
+        assignments['edge'] = cluster_labels.map(cluster_to_edge)
         assignments['latent_time'] = rng.random(size=self.adata.n_obs)
         return assignments
 
     def initialize_emission_parameters(self, cell_assignment):
         X = np.asarray(self.adata.X)
         cell_to_index = {cell: idx for idx, cell in enumerate(self.adata.obs_names)}
+        inv_map = {v: k for k, v in self.node_to_index.items()}
+
+        # For g: mean expression per node
         node_expr = {node: [] for node in self.G_traj.nodes()}
-    
-        # Aggregate expression for each node
-        for edge in self.G_traj.edges():
-            df = cell_assignment[cell_assignment['edge'] == edge]
-            if df.empty:
-                continue
+
+        for (u_idx, v_idx) in self.edge_list:
+            u_name = inv_map[u_idx]
+            v_name = inv_map[v_idx]
+
+            df = cell_assignment[cell_assignment['edge'] == (u_idx, v_idx)]
             for cell in df.index:
                 expr = X[cell_to_index[cell]]
-                node_expr[edge[0]].append(expr)
-                node_expr[edge[1]].append(expr)
-    
-        # Compute mean expression per node
+                node_expr[u_name].append(expr)
+                node_expr[v_name].append(expr)
+
         self.node_emission = {
             node: np.mean(expr_list, axis=0) if expr_list else np.zeros(X.shape[1])
             for node, expr_list in node_expr.items()
         }
-    
-        # Initialize edge-specific variance (r²), dropout (pi), and K
+
+        # For emission params
         emission_params = {}
-        for edge in self.G_traj.edges():
+        for edge in self.edge_list:
             df = cell_assignment[cell_assignment['edge'] == edge]
             if df.empty:
                 var_expr = np.ones(X.shape[1])
@@ -185,14 +189,16 @@ class TrajectoryGraph:
                 'r2': var_expr,
                 'pi': pi_val
             }
-    
+
         self.emission_params = emission_params
         return emission_params
 
-
     def plot_cells_on_trajectory(self, cell_assignment, **kwargs):
-        plot_cells_on_trajectory(self.G_traj, cell_assignment, self.adata, branch_probs=self.branch_probabilities, **kwargs)
-
+        # Convert edge indices back to node names for plotting
+        inv_map = {v: k for k, v in self.node_to_index.items()}
+        plot_df = cell_assignment.copy()
+        plot_df['edge'] = plot_df['edge'].map(lambda e: (inv_map[e[0]], inv_map[e[1]]) if pd.notnull(e) else None)
+        plot_cells_on_trajectory(self.G_traj, plot_df, self.adata, branch_probs=self.branch_probabilities, **kwargs)
 
 def initialize_trajectory(adata, random_state=None, debug=False):
     traj_graph = TrajectoryGraph(adata, random_state=random_state or np.random.randint(0, 2**32 - 1))
@@ -201,5 +207,5 @@ def initialize_trajectory(adata, random_state=None, debug=False):
     if debug:
         print("Trajectory graph nodes:", list(traj_graph.G_traj.nodes()))
         print("Trajectory graph edges:", list(traj_graph.G_traj.edges()))
-        print("\nSample cell assignments:\n", cell_assignment.head())
+        print("\nSample cell assignments (index-based):\n", cell_assignment.head())
     return traj_graph, cell_assignment
