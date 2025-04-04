@@ -191,4 +191,4 @@ def update_emission_means_variances(
     sigma2_new = sum_weighted_sq_diff / (sum_weights.unsqueeze(1) + epsilon)
     sigma2_new = sigma2_new.clamp(min=epsilon)
 
-    return g_new.detach(), sigma2_new.detach()
+    return g_new, sigma2_new
