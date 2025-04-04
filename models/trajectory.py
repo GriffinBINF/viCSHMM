@@ -25,6 +25,9 @@ class TrajectoryGraph:
         self.edge_segments = []
 
         self._initialize_graph()
+        self.index_to_node = {i: n for n, i in self.node_to_index.items()}
+        self.edge_tuple_to_index = {edge: i for i, edge in enumerate(self.edge_list)}
+
         self._initialize_transition_probabilities()
         self._compute_edge_segments()
 
@@ -125,13 +128,12 @@ class TrajectoryGraph:
             for v in children:
                 self.transition_probabilities[(u, v)] = weights[v] / Z_u
                 self.G_traj.edges[u, v]['A'] = self.transition_probabilities[(u, v)]
-
+                
     def _compute_edge_segments(self):
-        inv_map = {v: k for k, v in self.node_to_index.items()}
         self.edge_segments = []
         for u_idx, v_idx in self.edge_list:
-            u_name = inv_map[u_idx]
-            v_name = inv_map[v_idx]
+            u_name = self.index_to_node[u_idx]
+            v_name = self.index_to_node[v_idx]
             t_u = self.G_traj.nodes[u_name].get('t', 0.0)
             t_v = self.G_traj.nodes[v_name].get('t', 1.0)
             self.edge_segments.append((min(t_u, t_v), max(t_u, t_v)))
@@ -139,7 +141,7 @@ class TrajectoryGraph:
     def assign_cells_to_paths(self, random_state=0):
         rng = np.random.default_rng(random_state)
         cluster_to_edge = {
-            data['label']: (self.node_to_index[src], self.node_to_index[dst])
+            data['label']: (src, dst)
             for src, dst, data in self.G_traj.edges(data=True) if 'label' in data
         }
 
@@ -152,20 +154,18 @@ class TrajectoryGraph:
     def initialize_emission_parameters(self, cell_assignment):
         X = np.asarray(self.adata.X)
         cell_to_index = {cell: idx for idx, cell in enumerate(self.adata.obs_names)}
-        inv_map = {v: k for k, v in self.node_to_index.items()}
 
         # For g: mean expression per node
-        node_expr = {node: [] for node in self.G_traj.nodes()}
+        node_expr = {self.node_to_index[node]: [] for node in self.G_traj.nodes()}
 
-        for (u_idx, v_idx) in self.edge_list:
-            u_name = inv_map[u_idx]
-            v_name = inv_map[v_idx]
-
-            df = cell_assignment[cell_assignment['edge'] == (u_idx, v_idx)]
+        for edge in self.edge_list:
+            u_idx, v_idx = edge
+            df = cell_assignment[cell_assignment['edge'] == (self.index_to_node[u_idx], self.index_to_node[v_idx])]
             for cell in df.index:
                 expr = X[cell_to_index[cell]]
-                node_expr[u_name].append(expr)
-                node_expr[v_name].append(expr)
+                node_expr[u_idx].append(expr)
+                node_expr[v_idx].append(expr)
+
 
         self.node_emission = {
             node: np.mean(expr_list, axis=0) if expr_list else np.zeros(X.shape[1])
@@ -173,7 +173,6 @@ class TrajectoryGraph:
         }
 
         # For emission params
-        emission_params = {}
         for edge in self.edge_list:
             df = cell_assignment[cell_assignment['edge'] == edge]
             if df.empty:
@@ -184,20 +183,18 @@ class TrajectoryGraph:
                 var_expr = np.var(expr_edge, axis=0)
                 pi_val = np.mean(expr_edge == 0, axis=0)
             K = np.ones_like(var_expr)
-            emission_params[edge] = {
+            edge_idx = self.edge_tuple_to_index[edge]
+            self.emission_params[edge_idx] = {
                 'K': K,
                 'r2': var_expr,
                 'pi': pi_val
             }
-
-        self.emission_params = emission_params
-        return emission_params
+        return self.emission_params
 
     def plot_cells_on_trajectory(self, cell_assignment, **kwargs):
         # Convert edge indices back to node names for plotting
-        inv_map = {v: k for k, v in self.node_to_index.items()}
         plot_df = cell_assignment.copy()
-        plot_df['edge'] = plot_df['edge'].map(lambda e: (inv_map[e[0]], inv_map[e[1]]) if pd.notnull(e) else None)
+
         plot_cells_on_trajectory(self.G_traj, plot_df, self.adata, branch_probs=self.branch_probabilities, **kwargs)
 
 def initialize_trajectory(adata, random_state=None, debug=False):

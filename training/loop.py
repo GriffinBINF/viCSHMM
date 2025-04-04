@@ -108,7 +108,10 @@ def train_model(
     g_vals = []
     
     for (u, v), idx in sorted(edge_to_index.items(), key=lambda x: x[1]):
-        params = traj_graph.emission_params.get((u, v), None)
+        
+        edge_index = edge_to_index[(u, v)]
+        params = traj_graph.emission_params.get(edge_index, None)
+
         if params is None:
             raise ValueError(f"Missing emission parameters for edge {(u, v)} in traj_graph.")
         K_vals.append(params['K'])
@@ -408,15 +411,15 @@ def train_model(
                 val = last_batch_metrics.get(key, 0.0) # Default to 0.0 if key not present (e.g., 'loss')
              # Aggregate only the component terms, not the total loss again
                 if key != 'loss':
-                    epoch_metrics_agg[key] += val # val should already be float from metrics_detached
+                    epoch_metrics_agg[key] += val * len(cell_indices_batch)
             total_batches += 1
 
-        avg_loss_epoch = total_loss_accum / total_batches if total_batches > 0 else 0.0
+        avg_loss_epoch = total_loss_accum / X.shape[0] if total_batches > 0 else 0.0
         log_history["loss"].append(avg_loss_epoch) # Use the new key 'loss'
         for key in log_history.keys():
             if key != "loss": # Already saved avg_loss_epoch
                 # Use the aggregated sum divided by batches
-                averaged_metric = epoch_metrics_agg.get(key, float('nan')) / total_batches if total_batches > 0 else float('nan')
+                averaged_metric = epoch_metrics_agg.get(key, float('nan')) / X.shape[0]
                 log_history[key].append(averaged_metric)
 
         K_final_epoch = F.softplus(K_raw).detach()
@@ -445,6 +448,7 @@ def train_model(
     print(f"--- Training Finished ---")
     posterior.eval()
     return posterior, g, F.softplus(K_raw).detach(), sigma2, pi.detach() if pi is not None else None, log_history
+
 
 
 
