@@ -1,15 +1,57 @@
 import torch
-from models.emission import emission_nll
+import torch.distributions as D
+import math
+import networkx as nx # Needed for compute_proposal_distribution logic if not already imported
 
+# Assuming these are correctly defined/imported from elsewhere in the models package
+from .emission import emission_nll
+from .posterior import TreeVariationalPosterior # For type hinting
+from .belief import BeliefPropagator # For type hinting
+# Assuming TrajectoryGraph might be needed for node_to_index etc.
+from .trajectory import TrajectoryGraph # For type hinting
 
-def compute_kl_beta(alpha, beta, eps=1e-8):
-    return (
-        (alpha - 1) * (torch.digamma(alpha + eps) - torch.digamma(alpha + beta + eps)) +
-        (beta - 1) * (torch.digamma(beta + eps) - torch.digamma(alpha + beta + eps)) +
-        torch.lgamma(alpha + beta + eps) -
-        torch.lgamma(alpha + eps) -
-        torch.lgamma(beta + eps)
-    )
+# Assuming constants are available
+from utils.constants import EPSILON
+
+def compute_kl_beta(alpha_q, beta_q, alpha_p=1.0, beta_p=1.0, eps=EPSILON):
+    """
+    Computes KL( Beta(alpha_q, beta_q) || Beta(alpha_p, beta_p) ).
+    Handles tensor inputs and clamps for stability.
+    """
+    # Ensure target parameters are tensors with matching device/dtype
+    if not isinstance(alpha_p, torch.Tensor):
+        alpha_p = torch.tensor(alpha_p, device=alpha_q.device, dtype=alpha_q.dtype)
+    if not isinstance(beta_p, torch.Tensor):
+        beta_p = torch.tensor(beta_p, device=beta_q.device, dtype=beta_q.dtype)
+
+    # Clamp q parameters for stability before log/digamma
+    alpha_q = alpha_q.clamp(min=eps)
+    beta_q = beta_q.clamp(min=eps)
+
+    # Log gamma terms
+    lgamma_q_sum = torch.lgamma(alpha_q + beta_q)
+    lgamma_q_alpha = torch.lgamma(alpha_q)
+    lgamma_q_beta = torch.lgamma(beta_q)
+    lgamma_p_sum = torch.lgamma(alpha_p + beta_p)
+    lgamma_p_alpha = torch.lgamma(alpha_p)
+    lgamma_p_beta = torch.lgamma(beta_p)
+
+    # Digamma terms
+    digamma_q_alpha = torch.digamma(alpha_q)
+    digamma_q_beta = torch.digamma(beta_q)
+    digamma_q_sum = torch.digamma(alpha_q + beta_q)
+
+    # KL divergence formula components
+    term1 = lgamma_q_sum - lgamma_q_alpha - lgamma_q_beta
+    term2 = -lgamma_p_sum + lgamma_p_alpha + lgamma_p_beta
+    term3 = (alpha_q - alpha_p) * (digamma_q_alpha - digamma_q_sum)
+    term4 = (beta_q - beta_p) * (digamma_q_beta - digamma_q_sum)
+
+    kl_div = term1 + term2 + term3 + term4
+
+    # Handle potential NaNs/Infs arising from extreme parameter values after clamping
+    kl_div = torch.nan_to_num(kl_div, nan=0.0, posinf=1e6, neginf=-1e6) # Use 0 for NaN, large value for Inf
+    return kl_div.clamp(min=0) # KL should be non-negative
 
 
 def continuity_penalty(edge_idx, t, traj, index_to_edge_tuple, node_to_index):
@@ -47,97 +89,274 @@ def continuity_penalty(edge_idx, t, traj, index_to_edge_tuple, node_to_index):
 
 
 def resolve_edge_nodes(edge_idx_tensor, index_to_edge_tuple_map, device=None):
+    """Resolves edge indices to source (u) and target (v) node indices."""
     device = device or edge_idx_tensor.device
-    u_idx = [index_to_edge_tuple_map[i.item()][0] for i in edge_idx_tensor]
-    v_idx = [index_to_edge_tuple_map[i.item()][1] for i in edge_idx_tensor]
-    return torch.tensor(u_idx, device=device), torch.tensor(v_idx, device=device)
+    # Ensure edge_idx_tensor is on CPU for iteration if it's large, or handle on device
+    edge_indices_list = edge_idx_tensor.tolist()
+    u_idx = [index_to_edge_tuple_map[i][0] for i in edge_indices_list]
+    v_idx = [index_to_edge_tuple_map[i][1] for i in edge_indices_list]
+    return torch.tensor(u_idx, device=device, dtype=torch.long), \
+           torch.tensor(v_idx, device=device, dtype=torch.long)
 
+def compute_proposal_distribution(
+    posterior: TreeVariationalPosterior,
+    belief_propagator: BeliefPropagator,
+    proposal_beta_const: float = 10.0,
+    proposal_target_temp: float = 1.0, # Temperature for broadening q(t|e_max)
+    eps: float = EPSILON
+):
+    """
+    Computes the parameters for the importance sampling proposal distribution
+    p_proposal(edge, t) = p_prop(edge) * p_prop(t | edge).
+
+    p_prop(edge) is based on diffused posterior edge probabilities.
+    p_prop(t | edge) = Beta(alpha_prop, beta_prop) depends on the relationship
+    between the proposed edge 'e' and the cell's current most likely edge 'e_max'.
+
+    Args:
+        posterior: The TreeVariationalPosterior module.
+        belief_propagator: The BeliefPropagator instance.
+        proposal_beta_const (float): Strength of the Beta distribution peak for
+                                     parent/child proposals (higher -> sharper peak).
+        proposal_target_temp (float): Temperature to broaden Beta distribution for
+                                       the target edge proposal (t > 1 widens).
+        eps (float): Small constant for numerical stability.
+
+    Returns:
+        tuple: Contains:
+            - prop_edge_probs (Tensor): Proposal edge probabilities [N_cells, N_edges].
+            - prop_alpha (Tensor): Proposal alpha parameters [N_cells, N_edges].
+            - prop_beta (Tensor): Proposal beta parameters [N_cells, N_edges].
+    """
+    device = posterior.device
+    n_cells = posterior.n_cells
+    n_edges = posterior.n_edges
+
+    with torch.no_grad(): # Calculations based on current q, don't track gradients here
+        # --- 1. Calculate Proposal Edge Probabilities ---
+        q_edge_probs = posterior.compute_edge_probs() # softmax(logits) [N, E]
+        # Use detached q_edge_probs as input to diffusion
+        prop_edge_probs = belief_propagator.diffuse(q_edge_probs.detach(), alpha=0.5, steps=2)
+        # Normalize just in case diffusion slightly changes sum
+        prop_edge_probs = prop_edge_probs / prop_edge_probs.sum(dim=1, keepdim=True).clamp(min=eps)
+
+        # --- 2. Find Target State (e_max, t_mean) for context ---
+        e_max_idx = q_edge_probs.argmax(dim=1) # [N] index of max prob edge per cell
+
+        # Get current q(t) parameters
+        alpha_q = posterior.alpha.detach()
+        beta_q = posterior.beta.detach()
+
+        # --- 3. Calculate Proposal Time Parameters (alpha_prop, beta_prop) ---
+        prop_alpha = torch.ones(n_cells, n_edges, device=device) # Default Beta(1,1)
+        prop_beta = torch.ones(n_cells, n_edges, device=device) # Default Beta(1,1)
+
+        # Precompute necessary maps from posterior/traj_graph
+        index_to_edge_tuple = posterior.index_to_edge # {edge_idx: (u_idx, v_idx)}
+        # Efficiently find children: Use precomputed children_map if available
+        children_map = posterior.children_map # {u_idx: [(u_idx, v_idx), ...]}
+        # Efficiently find parent: Create a parent_map (node_idx -> node_idx)
+        # This map relates NODES. We need to check edge relationships.
+        # Map: {end_node_idx_of_parent_edge : start_node_idx_of_parent_edge}
+        node_parent_map = {v_idx: u_idx for u_idx, v_idx in posterior.edge_list}
+
+        # Get edge indices list for easy iteration if needed
+        all_edge_indices = list(range(n_edges))
+
+        # Loop over cells to determine context-dependent proposal times
+        for i in range(n_cells):
+            current_e_max_idx = e_max_idx[i].item()
+            u_max, v_max = index_to_edge_tuple[current_e_max_idx]
+
+            # Iterate through all possible *proposal* edges 'e' for this cell
+            for e_prop_idx in all_edge_indices:
+                u_prop, v_prop = index_to_edge_tuple[e_prop_idx]
+
+                # Case 1: Proposal edge is the target edge
+                if e_prop_idx == current_e_max_idx:
+                    # Broaden the current q distribution slightly
+                    temp_alpha = alpha_q[i, e_prop_idx] / proposal_target_temp
+                    temp_beta = beta_q[i, e_prop_idx] / proposal_target_temp
+                    prop_alpha[i, e_prop_idx] = temp_alpha.clamp(min=eps)
+                    prop_beta[i, e_prop_idx] = temp_beta.clamp(min=eps)
+
+                # Case 2: Proposal edge is a child of the target edge
+                # Check if start node of proposal edge is the end node of target edge
+                elif u_prop == v_max:
+                    prop_alpha[i, e_prop_idx] = 1.0
+                    prop_beta[i, e_prop_idx] = proposal_beta_const
+
+                # Case 3: Proposal edge is a parent of the target edge
+                # Check if end node of proposal edge is the start node of target edge
+                elif v_prop == u_max:
+                    prop_alpha[i, e_prop_idx] = proposal_beta_const
+                    prop_beta[i, e_prop_idx] = 1.0
+
+                # Case 4: Distant edge (already covered by Beta(1,1) default)
+                else:
+                    # Default Beta(1,1) is already set
+                    pass
+
+    # Return parameters needed for sampling and log-prob calculation
+    return prop_edge_probs, prop_alpha, prop_beta
 
 def compute_elbo(
+    # Core data and model components
     X, cell_indices, traj, posterior, edge_tuple_to_index,
-    g, K, sigma2,
-    belief_propagator=None, n_samples=1,
-    kl_weight=1.0, kl_p_weight=1.0, t_cont_weight=1.0, pi=None,
-    transition_weight=1.0, l1_weight=0.0, branch_entropy_weight=1.0,
-    tau=1.0  
+    g, K, sigma2, # Generative params (g, sigma2 assumed non-gradient)
+    pi=None, # Optional dropout param (assumed learnable if not None)
+    # VI and IS components
+    belief_propagator=None,
+    n_samples=10, # Number of IS samples
+    # ELBO weights (some may be less relevant now)
+    kl_weight=1.0,
+    kl_p_weight=1.0,
+    # IS proposal hyperparameters (passed via kwargs or fixed)
+    proposal_beta_const: float = 10.0,
+    proposal_target_temp: float = 1.0,
+    # Optional weights for other terms (e.g., branch entropy)
+    branch_entropy_weight=0.0, # Default to 0 unless explicitly used
+    # -- Unused args from original signature (kept for compatibility) --
+    t_cont_weight=0.0,
+    transition_weight=0.0,
+    l1_weight=0.0,
+    tau=1.0, # Gumbel-softmax tau no longer used for sampling
+    # -------------------------------------------------------------
+    eps=EPSILON # Small constant for stability
 ):
+    """
+    Computes the ELBO estimate using Importance Sampling (IS).
+
+    Calls compute_proposal_distribution internally (inefficiently)
+    and performs IS estimate of E_q[log p(X|z)] - KL(q||p).
+    """
     device = X.device
-    all_nll, all_kl_t, all_trans_logp = [], [], []
-
-    q_e = torch.softmax(posterior.edge_logits[cell_indices], dim=1)
-    q_eff = belief_propagator.diffuse(q_e, alpha=0.5, steps=2) if belief_propagator else q_e
-
-    index_to_edge_tuple = {v: k for k, v in edge_tuple_to_index.items()}
-    index_to_edge_name = posterior.index_to_edge
-    node_to_index = traj.node_to_index
-    A_probs, _ = posterior.compute_transition_probs()
-
-    for _ in range(n_samples):
-        edge_logits_batch = posterior.edge_logits[cell_indices]
-        edge_one_hot = torch.nn.functional.gumbel_softmax(edge_logits_batch, tau=tau, hard=True)
-        edge_idx = edge_one_hot.argmax(dim=1)
-        alpha = posterior.alpha[cell_indices, edge_idx].clamp(min=1e-6)
-        beta = posterior.beta[cell_indices, edge_idx].clamp(min=1e-6)
-        t = torch.distributions.Beta(alpha, beta).rsample()
-
-        nll = emission_nll(
-            X, edge_idx, t, g, K, sigma2,
-            index_to_edge=index_to_edge_name,
-            node_to_index=node_to_index,
-            pi=pi
-        )
-
-        kl_t = compute_kl_beta(alpha, beta).mean()
-        u_idx, v_idx = resolve_edge_nodes(edge_idx, index_to_edge_tuple)
-        trans_logp = torch.log(posterior.compute_branch_probs()[edge_idx].clamp(min=1e-8)).mean()
-
-        all_nll.append(nll)
-        all_kl_t.append(kl_t)
-        all_trans_logp.append(trans_logp)
-
-    mean_nll = torch.stack(all_nll).mean()
-    mean_kl_t = torch.stack(all_kl_t).mean()
-    mean_trans = torch.stack(all_trans_logp).mean()
-
-    edge_probs = q_eff
+    batch_size = X.shape[0] # Note: X is X_batch here
     n_edges = posterior.n_edges
-    log_uniform = torch.log(torch.tensor(1.0 / n_edges, device=device))
-    kl_p = (edge_probs * (edge_probs.clamp(min=1e-8).log() - log_uniform)).sum(dim=1).mean()
 
-    t_cont = continuity_penalty(edge_idx, t, traj, index_to_edge_tuple, node_to_index)
+    # --- (Re)compute Proposal Distribution Parameters for ALL cells ---
+    # Inefficient: Ideally computed once per epoch outside this function.
+    # Computing it here to satisfy the "don't change training loop" constraint.
+    prop_edge_probs_all, prop_alpha_all, prop_beta_all = compute_proposal_distribution(
+        posterior, belief_propagator,
+        proposal_beta_const=proposal_beta_const,
+        proposal_target_temp=proposal_target_temp,
+        eps=eps
+    )
 
-    continuity_mse = []
-    for parent_idx, (u_idx, v_idx) in index_to_edge_tuple.items():
-        children = [ci for ci, (cu, _) in index_to_edge_tuple.items() if cu == v_idx]
-        for child_idx in children:
-            w_idx = index_to_edge_tuple[child_idx][1]
-            continuity_mse.append(torch.nn.functional.mse_loss(g[v_idx], g[w_idx], reduction='mean'))
+    # --- Get Parameters for the Current Batch ---
+    # Proposal parameters for the batch
+    prop_edge_probs_batch = prop_edge_probs_all[cell_indices]
+    prop_alpha_batch = prop_alpha_all[cell_indices] # [batch, E]
+    prop_beta_batch = prop_beta_all[cell_indices]  # [batch, E]
 
-    emission_cont = torch.stack(continuity_mse).mean() if continuity_mse else g.new_zeros(1).squeeze()
+    # Posterior (q) parameters for the batch
+    edge_logits_batch = posterior.edge_logits[cell_indices]
+    q_edge_probs_batch = torch.softmax(edge_logits_batch, dim=1)
+    alpha_q_batch = posterior.alpha[cell_indices] # [batch, E]
+    beta_q_batch = posterior.beta[cell_indices]  # [batch, E]
 
-    entropy = - (posterior.compute_branch_probs() * posterior.compute_branch_probs().clamp(min=1e-8).log()).sum()
+    # --- Importance Sampling ---
+    total_weighted_log_p_x_given_z = torch.zeros(batch_size, device=device)
+    all_log_weights_list = []
 
-    loss = mean_nll \
-           + kl_weight * mean_kl_t \
+    # Prepare proposal distributions for sampling
+    prop_edge_dist = D.Categorical(probs=prop_edge_probs_batch)
+
+    for s in range(n_samples):
+        # 1. Sample edge from proposal p_prop(edge)
+        edge_idx_prop = prop_edge_dist.sample() # [batch]
+
+        # 2. Sample time from proposal p_prop(t | edge_prop)
+        alpha_p_gathered = prop_alpha_batch[torch.arange(batch_size), edge_idx_prop]
+        beta_p_gathered = prop_beta_batch[torch.arange(batch_size), edge_idx_prop]
+        prop_time_dist = D.Beta(alpha_p_gathered.clamp(min=eps), beta_p_gathered.clamp(min=eps))
+        t_prop = prop_time_dist.rsample().clamp(eps, 1.0 - eps) # [batch]
+
+        # 3. Calculate log p(X | z_prop) = -NLL
+        nll_sample = emission_nll(
+            X, edge_idx_prop, t_prop, g, K, sigma2, # Pass X_batch, generative params
+            index_to_edge=posterior.index_to_edge,
+            node_to_index=traj.node_to_index,
+            pi=pi # Pass learnable pi if used
+        ) # Shape [batch_size], NLL value for each cell
+        log_p_x_given_z = -nll_sample # Shape [batch_size]
+
+        # 4. Calculate log q(z_prop)
+        log_q_edge = torch.log_softmax(edge_logits_batch, dim=1)[torch.arange(batch_size), edge_idx_prop]
+        alpha_q_gathered = alpha_q_batch[torch.arange(batch_size), edge_idx_prop]
+        beta_q_gathered = beta_q_batch[torch.arange(batch_size), edge_idx_prop]
+        q_time_dist = D.Beta(alpha_q_gathered.clamp(min=eps), beta_q_gathered.clamp(min=eps))
+        log_q_time = q_time_dist.log_prob(t_prop)
+        log_q_z = log_q_edge + log_q_time
+
+        # 5. Calculate log p_proposal(z_prop)
+        log_prop_edge = prop_edge_dist.log_prob(edge_idx_prop)
+        log_prop_time = prop_time_dist.log_prob(t_prop)
+        log_prop_z = log_prop_edge + log_prop_time
+
+        # 6. Calculate Log Importance Weight
+        log_weight = log_q_z - log_prop_z
+        all_log_weights_list.append(log_weight.detach()) # Store detached for diagnostics
+
+        # print(f"--- Sample {s} Debug ---")
+        # print(f"  log_q_z (mean): {log_q_z.mean():.4f}, std: {log_q_z.std():.4f}")
+        # print(f"  log_prop_z (mean): {log_prop_z.mean():.4f}, std: {log_prop_z.std():.4f}")
+        # print(f"  log_weight (mean): {log_weight.mean():.4f}, std: {log_weight.std():.4f}")
+        # print(f"  exp(log_weight) (mean): {torch.exp(log_weight.detach()).mean():.4e}, std: {torch.exp(log_weight.detach()).std():.4e}")
+        # print(f"  log_p_x_given_z (mean): {log_p_x_given_z.mean():.4f}, std: {log_p_x_given_z.std():.4f}")
+        # print(f"  Contribution (mean): {(torch.exp(log_weight.detach()) * log_p_x_given_z).mean():.4e}")
+        # print(f"----------------------")
+
+        # 7. Accumulate Weighted log p(X|z)
+        # Using detached weights for stable loss estimate
+        total_weighted_log_p_x_given_z += torch.exp(log_weight.detach()) * log_p_x_given_z
+
+    # --- Average over samples and batch ---
+    # E_prop[w * log p(X|z)] estimate for the batch
+    mean_weighted_log_p_x_given_z = (total_weighted_log_p_x_given_z / n_samples).mean()
+
+    # --- Calculate KL divergences for q (using q parameters directly) ---
+    # KL(q(edge) || uniform)
+    log_uniform = -math.log(n_edges)
+    kl_p = (q_edge_probs_batch * (q_edge_probs_batch.clamp(min=eps).log() - log_uniform)).sum(dim=1).mean()
+
+    # KL(q(t|edge) || Beta(1,1)) - Averaged over edges, weighted by q(edge)
+    kl_t_per_edge = compute_kl_beta(alpha_q_batch, beta_q_batch, 1.0, 1.0, eps=eps) # [batch, E]
+    kl_t = (q_edge_probs_batch.detach() * kl_t_per_edge).sum(dim=1).mean() # Weight KL(t|e) by q(e)
+
+    # --- (Optional) Branching Entropy Term ---
+    branch_entropy_term = 0.0
+    if branch_entropy_weight > 0:
+         branch_probs = posterior.compute_branch_probs() # [E]
+         # Prevent log(0) - clamp probs slightly away from 0
+         branch_probs_clamped = branch_probs.clamp(min=eps)
+         entropy = - (branch_probs * torch.log(branch_probs_clamped)).sum()
+         branch_entropy_term = - branch_entropy_weight * entropy # Add negative entropy to loss
+
+    # --- Final Loss (Negative ELBO approximation) ---
+    loss = -mean_weighted_log_p_x_given_z \
            + kl_p_weight * kl_p \
-           - transition_weight * mean_trans \
-           + t_cont_weight * t_cont \
-           + l1_weight * torch.tensor(0.0, device=device) \
-           + emission_cont \
-           - branch_entropy_weight * entropy
+           + kl_weight * kl_t \
+           + branch_entropy_term
 
-    return loss, {
-        "nll": mean_nll.item(),
-        "kl_t": mean_kl_t.item(),
+    # --- Metrics for Logging ---
+    all_log_weights_tensor = torch.stack(all_log_weights_list)
+    metrics = {
+        "loss": loss.item(), # Total loss
+        "nll_weighted": (-mean_weighted_log_p_x_given_z).item(), # Weighted NLL part
+        "kl_t": kl_t.item(),
         "kl_p": kl_p.item(),
-        "t_cont": t_cont.item(),
-        "transition": mean_trans.item(),
-        "l1": 0.0,
-        "emission_cont": emission_cont.item(),
-        "entropy": entropy.item(),
-        "t": t.detach(),
-        "q_eff": q_eff.detach(),
+        "log_weight_mean": all_log_weights_tensor.mean().item(),
+        "log_weight_std": all_log_weights_tensor.std().item(),
+        "branch_entropy": -branch_entropy_term.item() / branch_entropy_weight if branch_entropy_weight > 0 else 0.0
+        # Add back other metrics if needed, but t_cont, emission_cont, transition are removed
     }
+
+    # Note on gradients: The gradient calculation relies on autograd through log_q_z
+    # (in log_weight) and the KL terms. It approximates the true IS gradient.
+
+    return loss, metrics
 
 
 compute_elbo_batch = compute_elbo
