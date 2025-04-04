@@ -20,6 +20,43 @@ def find_path_index_for_edge(edge, posterior):
         if edge in edge_list:
             return i
     return None
+    
+def initialize_edge_logits_from_assignment(
+    posterior,
+    cell_assignment,
+    traj_graph,
+    edge_to_index,
+    high=5.0,
+    low=0.0
+):
+    """
+    Initializes posterior.edge_logits with a strong preference for the assigned edge.
+    Unassigned edges receive a baseline value (typically 0).
+
+    Args:
+        posterior (TreeVariationalPosterior): The posterior object whose logits will be modified.
+        cell_assignment (pd.DataFrame): Contains 'edge' for each cell.
+        traj_graph (TrajectoryGraph): Needed to map node names to indices.
+        edge_to_index (dict): Mapping from (u_idx, v_idx) → edge index.
+        high (float): Logit value for the assigned edge.
+        low (float): Logit value for unassigned edges.
+    """
+    n_cells, n_edges = posterior.edge_logits.shape
+    posterior.edge_logits.data[:] = low
+
+    for i, row in enumerate(cell_assignment.itertuples()):
+        edge = row.edge
+        if edge is None or pd.isna(edge):
+            continue
+
+        u_name, v_name = str(edge[0]).strip(), str(edge[1]).strip()
+        u_idx = traj_graph.node_to_index.get(u_name)
+        v_idx = traj_graph.node_to_index.get(v_name)
+        edge_idx = edge_to_index.get((u_idx, v_idx))
+
+        if edge_idx is not None:
+            posterior.edge_logits.data[i, edge_idx] = high
+
 
 
 def initialize_beta_from_cell_assignment(

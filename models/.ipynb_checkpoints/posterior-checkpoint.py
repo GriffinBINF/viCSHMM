@@ -17,7 +17,23 @@ class TreeVariationalPosterior(nn.Module):
 
         self.alpha = nn.Parameter(torch.ones(n_cells, self.n_edges, device=device))
         self.beta = nn.Parameter(torch.ones(n_cells, self.n_edges, device=device))
-        self.edge_logits = nn.Parameter(1e-2 * torch.randn(n_cells, self.n_edges, device=device))
+        # Initialize edge_logits to strongly favor the assigned edge
+        from utils.inference import initialize_edge_logits_from_assignment
+        
+        logits_init = initialize_edge_logits_from_assignment(
+            cell_assignment=cell_assignment,
+            traj_graph=traj_graph,
+            edge_to_index=self.edge_to_index,
+            n_cells=n_cells,
+            n_edges=self.n_edges,
+            high=5.0,
+            low=0.0,
+            device=device
+        )
+        
+        self.edge_logits = nn.Parameter(logits_init)
+
+
         self.branch_logits = nn.Parameter(torch.zeros(self.n_edges, device=device))
 
         self.edge_to_index = {(u, v): i for i, (u, v) in enumerate(self.edge_list)}

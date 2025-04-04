@@ -1,6 +1,6 @@
 import torch
 import math
-
+from utils.constants import EPSILON, EPSILON_LOG
 
 def pack_emission_params(traj, device='cpu'):
     name_to_index = traj.node_to_index
@@ -41,35 +41,103 @@ def pack_emission_params(traj, device='cpu'):
 import math
 import torch
 
-def emission_nll(X, P_idx, T, g, K, log_sigma2, index_to_edge, node_to_index, pi=None):
+def emission_nll(X, P_idx, T, g, K, sigma2_param, index_to_edge, node_to_index, pi=None):
+    """
+    Calculates the negative log-likelihood of observed data X given latent variables.
+    Corrected version to handle variance input and improve numerical stability.
+
+    Args:
+        X (Tensor): Gene expression data [batch_size, G].
+        P_idx (Tensor): Sampled edge indices [batch_size].
+        T (Tensor): Sampled latent time [batch_size].
+        g (Tensor): Node emission means [N_nodes, G].
+        K (Tensor): Edge-specific decay rates [E, G].
+        sigma2_param (Tensor): Edge-specific variances [E, G]. *Receives variance.*
+        index_to_edge (dict): Maps edge index -> (u_idx, v_idx) tuple.
+        node_to_index (dict): Maps node name -> node index.
+        pi (Tensor, optional): Dropout probabilities [E, G]. Defaults to None.
+
+    Returns:
+        Tensor: Mean negative log-likelihood over the batch (scalar).
+    """
     device = X.device
-    P_idx = P_idx.long()
+    P_idx = P_idx.long() # Ensure indices are long
 
-    # Use index-based edge tuples directly: (u_idx, v_idx)
+    # Resolve edge indices to node indices
     uv_pairs = [index_to_edge[i.item()] for i in P_idx]
-    u_idx = torch.tensor([u for u, _ in uv_pairs], device=device)
-    v_idx = torch.tensor([v for _, v in uv_pairs], device=device)
+    u_idx = torch.tensor([u for u, _ in uv_pairs], device=device, dtype=torch.long)
+    v_idx = torch.tensor([v for _, v in uv_pairs], device=device, dtype=torch.long)
 
+    # Get corresponding node means
     g_a = g[u_idx]
     g_b = g[v_idx]
 
-    sigma2 = log_sigma2.exp()  # 🔥 fix: sigma2 was in log-space
-    var = sigma2[P_idx]
+    # --- Robust Variance Handling ---
+    var = sigma2_param[P_idx].clamp(min=EPSILON)
+    log_var = var.clamp(min=EPSILON_LOG).log()
+    # --- End Robust Variance Handling ---
+
     mu = g_b + (g_a - g_b) * torch.exp(-K[P_idx] * T.unsqueeze(-1))
-    log_var = log_sigma2[P_idx]
+    sq_diff = (X - mu) ** 2
+    log_normal = -0.5 * (sq_diff / var + log_var + math.log(2 * math.pi))
 
-    log_normal = -0.5 * ((X - mu) ** 2 / (var + 1e-6) + log_var + math.log(2 * math.pi))
+    if not torch.all(torch.isfinite(log_normal)):
+        # print("--- DEBUG: Non-finite values in log_normal ---") # Keep if needed
+        log_normal = torch.nan_to_num(log_normal, nan=-1e8, posinf=-1e8, neginf=-1e8)
 
+
+    # Handle dropout component if pi is provided
     if pi is not None:
-        pi_vals = pi[P_idx].clamp(min=1e-6, max=1 - 1e-6)
-        log_zero = torch.log(pi_vals)
-        log_nonzero = torch.log1p(-pi_vals) + log_normal
-        log_prob = torch.where(X == 0, log_zero, log_nonzero)
+        pi_edge = pi[P_idx]
+
+        # --- More Robust Pi Clamping & Log Calculation ---
+        # Clamp slightly MORE strictly away from 1.0 to help float32
+        # Using 2*EPSILON_LOG, but can adjust if needed
+        pi_vals = pi_edge.clamp(min=EPSILON_LOG, max=1.0 - 2*EPSILON_LOG)
+
+        # Calculate log(pi) and log(1-pi)
+        log_zero = pi_vals.clamp(min=EPSILON_LOG).log() # Clamp again just before log
+        # Calculate log(1-pi). Clamp the argument (1-pi) away from zero before log.
+        log_one_minus_pi = (1.0 - pi_vals).clamp(min=EPSILON_LOG).log()
+        # --- End More Robust Pi Handling ---
+
+        # --- Debug Checks for Logs ---
+        if not torch.all(torch.isfinite(log_zero)):
+             print(f"--- DEBUG PI (Corrected): Non-finite log_zero! pi_vals min: {pi_vals.min():.2e}")
+             log_zero = torch.nan_to_num(log_zero, nan=-1e8, posinf=-1e8, neginf=-1e8)
+        if not torch.all(torch.isfinite(log_one_minus_pi)):
+             print(f"--- DEBUG PI (Corrected): Non-finite log_one_minus_pi! (1-pi_vals) min: {(1.0 - pi_vals).min():.2e}")
+             log_one_minus_pi = torch.nan_to_num(log_one_minus_pi, nan=-1e8, posinf=-1e8, neginf=-1e8)
+        # --- End Debug Checks ---
+
+        # Log probability for non-zero observations: log(1-pi) + log N(X | mu, var)
+        log_nonzero = log_one_minus_pi + log_normal
+
+        # No need to check log_nonzero separately if components are finite
+        # Add check + nan_to_num just in case addition causes issues (unlikely)
+        if not torch.all(torch.isfinite(log_nonzero)):
+             print(f"--- DEBUG PI (Corrected): Non-finite log_nonzero after addition!")
+             log_nonzero = torch.nan_to_num(log_nonzero, nan=-1e8, posinf=-1e8, neginf=-1e8)
+
+        # Select probability based on whether X is zero
+        is_zero = X == 0.0
+        log_prob = torch.where(is_zero, log_zero, log_nonzero)
     else:
+        # No dropout, just use the Gaussian log probability
         log_prob = log_normal
 
-    return -log_prob.sum(dim=1).mean()
 
+    if not torch.all(torch.isfinite(log_prob)):
+        # print("--- DEBUG: Non-finite values detected in final log_prob! Replacing. ---") # Keep if needed
+        log_prob = torch.nan_to_num(log_prob, nan=-1e8, posinf=-1e8, neginf=-1e8)
+
+    nll_per_cell = -log_prob.sum(dim=1)
+
+    if not torch.all(torch.isfinite(nll_per_cell)):
+        # print(f"--- DEBUG: Non-finite NLL per cell! Replacing. ---") # Keep if needed
+        nll_per_cell = torch.nan_to_num(nll_per_cell, nan=1e8, posinf=1e8, neginf=1e8)
+
+    return nll_per_cell.mean()
 
 
 
