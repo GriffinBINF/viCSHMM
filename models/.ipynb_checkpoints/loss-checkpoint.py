@@ -58,7 +58,8 @@ def compute_elbo(
     g, K, sigma2,
     belief_propagator=None, n_samples=1,
     kl_weight=1.0, kl_p_weight=1.0, t_cont_weight=1.0, pi=None,
-    transition_weight=1.0, l1_weight=0.0, branch_entropy_weight=1.0
+    transition_weight=1.0, l1_weight=0.0, branch_entropy_weight=1.0,
+    tau=1.0  
 ):
     device = X.device
     all_nll, all_kl_t, all_trans_logp = [], [], []
@@ -72,7 +73,9 @@ def compute_elbo(
     A_probs, _ = posterior.compute_transition_probs()
 
     for _ in range(n_samples):
-        edge_idx = torch.multinomial(q_eff, num_samples=1, replacement=True).squeeze(1)
+        edge_logits_batch = posterior.edge_logits[cell_indices]
+        edge_one_hot = torch.nn.functional.gumbel_softmax(edge_logits_batch, tau=tau, hard=True)
+        edge_idx = edge_one_hot.argmax(dim=1)
         alpha = posterior.alpha[cell_indices, edge_idx].clamp(min=1e-6)
         beta = posterior.beta[cell_indices, edge_idx].clamp(min=1e-6)
         t = torch.distributions.Beta(alpha, beta).rsample()

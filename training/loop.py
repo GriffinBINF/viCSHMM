@@ -23,7 +23,8 @@ def train_model(
     transition_weight=1.0,
     l1_weight=0.0,
     branch_entropy_weight=1.0,
-    lr=1e-2
+    lr=1e-2,
+    tau=1.0
 ):
     device = X.device
 
@@ -72,17 +73,18 @@ def train_model(
                 optimizer_inf.zero_grad()
                 cell_indices = torch.arange(X.shape[0], device=device)
                 elbo, metrics = compute_elbo(
-                    X, cell_indices, traj_graph, posterior, edge_tuple_to_index,
-                    g, K, sigma2, pi=pi,
-                    belief_propagator=belief_propagator,
-                    n_samples=n_samples,
-                    kl_weight=kl_weight,
-                    kl_p_weight=kl_p_weight,
-                    t_cont_weight=t_cont_weight,
-                    transition_weight=transition_weight,
-                    l1_weight=l1_weight,
-                    branch_entropy_weight=branch_entropy_weight
-                )
+                                X, cell_indices, traj_graph, posterior, edge_tuple_to_index,
+                                g, K, sigma2, pi=pi,
+                                belief_propagator=belief_propagator,
+                                n_samples=n_samples,
+                                kl_weight=kl_weight,
+                                kl_p_weight=kl_p_weight,
+                                t_cont_weight=t_cont_weight,
+                                transition_weight=transition_weight,
+                                l1_weight=l1_weight,
+                                branch_entropy_weight=branch_entropy_weight,
+                                tau=tau
+                            )
                 elbo.backward()
                 optimizer_inf.step()
 
@@ -90,17 +92,18 @@ def train_model(
                 optimizer_gen.zero_grad()
                 cell_indices = torch.arange(X.shape[0], device=device)
                 elbo, metrics = compute_elbo(
-                    X, cell_indices, traj_graph, posterior, edge_tuple_to_index,
-                    g, K, sigma2, pi=pi,
-                    belief_propagator=belief_propagator,
-                    n_samples=n_samples,
-                    kl_weight=kl_weight,
-                    kl_p_weight=kl_p_weight,
-                    t_cont_weight=t_cont_weight,
-                    transition_weight=transition_weight,
-                    l1_weight=l1_weight,
-                    branch_entropy_weight=branch_entropy_weight
-                )
+                                X, cell_indices, traj_graph, posterior, edge_tuple_to_index,
+                                g, K, sigma2, pi=pi,
+                                belief_propagator=belief_propagator,
+                                n_samples=n_samples,
+                                kl_weight=kl_weight,
+                                kl_p_weight=kl_p_weight,
+                                t_cont_weight=t_cont_weight,
+                                transition_weight=transition_weight,
+                                l1_weight=l1_weight,
+                                branch_entropy_weight=branch_entropy_weight,
+                                tau=tau 
+                            )
                 elbo.backward()
                 optimizer_gen.step()
 
@@ -117,7 +120,8 @@ def train_model(
                 t_cont_weight=t_cont_weight,
                 transition_weight=transition_weight,
                 l1_weight=l1_weight,
-                branch_entropy_weight=branch_entropy_weight
+                branch_entropy_weight=branch_entropy_weight,
+                tau = tau
             )
             elbo.backward()
             optimizer.step()
