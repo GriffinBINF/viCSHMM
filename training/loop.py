@@ -7,6 +7,8 @@ from models.loss import compute_elbo # Ensure this is the batch version
 from models.emission import update_emission_means_variances
 from utils.inference import batch_indices
 from utils.constants import EPSILON # For sigma2 clamping
+from models.proposal import compute_proposal_distribution
+
 
 def _set_requires_grad(params, value):
     """Helper function to set requires_grad for a list of parameters."""
@@ -200,11 +202,19 @@ def train_model(
 
         num_batches = math.ceil(X.shape[0] / batch_size)
         batch_generator = batch_indices(X.shape[0], batch_size=batch_size)
+        with torch.no_grad():
+            prop_edge_probs_all, prop_alpha_all, prop_beta_all = compute_proposal_distribution(
+                posterior,
+                belief_propagator,
+                proposal_beta_const=10.0,
+                proposal_target_temp=1.0
+            )
 
         for batch_idx, cell_indices_batch in enumerate(batch_generator):
             X_batch = X[cell_indices_batch].to(effective_device)
             batch_loss = 0.0
-            K = F.softplus(K_raw)
+            K_used = F.softplus(K_raw)
+            pi_used = pi
 
             if training_mode == 'joint':
                 freeze_posterior_now = epoch < freeze_posterior_epochs
@@ -228,10 +238,13 @@ def train_model(
                                                 posterior=posterior,
                                                 edge_tuple_to_index=edge_tuple_to_index,
                                                 g=g,
-                                                K=current_K,
+                                                K=K_used,
                                                 sigma2=sigma2,
-                                                pi=current_pi,                 # Correctly assign pi
+                                                pi=pi_used,                 # Correctly assign pi
                                                 belief_propagator=belief_propagator, # Correctly assign belief_propagator
+                                                prop_edge_probs_all=prop_edge_probs_all,
+                                                prop_alpha_all=prop_alpha_all,
+                                                prop_beta_all=prop_beta_all,
                                                 n_samples=n_samples,           # Correctly assign n_samples
                                                 kl_weight=kl_weight,
                                                 kl_p_weight=kl_p_weight,
@@ -266,10 +279,13 @@ def train_model(
                                                 posterior=posterior,
                                                 edge_tuple_to_index=edge_tuple_to_index,
                                                 g=g,
-                                                K=current_K,
+                                                K=K_used,
                                                 sigma2=sigma2,
-                                                pi=current_pi,                 # Correctly assign pi
+                                                pi=pi_used,                 # Correctly assign pi
                                                 belief_propagator=belief_propagator, # Correctly assign belief_propagator
+                                                prop_edge_probs_all=prop_edge_probs_all,
+                                                prop_alpha_all=prop_alpha_all,
+                                                prop_beta_all=prop_beta_all,
                                                 n_samples=n_samples,           # Correctly assign n_samples
                                                 kl_weight=kl_weight,
                                                 kl_p_weight=kl_p_weight,
@@ -293,10 +309,11 @@ def train_model(
                 if optimizer_inf:
                     _set_requires_grad(posterior_params, True)
                     _set_requires_grad(emission_params_optim, False)
-                    K_detached = F.softplus(K_raw).detach()
-                    pi_detached = pi.detach() if pi is not None else None
                     for _ in range(inference_steps):
                         optimizer_inf.zero_grad()
+                        K_used = F.softplus(K_raw).detach()
+                        pi_used = pi.detach() if pi is not None else None
+
                         loss, metrics = compute_elbo(
                                                 X=X_batch,                     # Use keyword args for clarity
                                                 cell_indices=cell_indices_batch,
@@ -304,10 +321,13 @@ def train_model(
                                                 posterior=posterior,
                                                 edge_tuple_to_index=edge_tuple_to_index,
                                                 g=g,
-                                                K=current_K,
+                                                K=K_used,
                                                 sigma2=sigma2,
-                                                pi=current_pi,                 # Correctly assign pi
+                                                pi=pi_used,                 # Correctly assign pi
                                                 belief_propagator=belief_propagator, # Correctly assign belief_propagator
+                                                prop_edge_probs_all=prop_edge_probs_all,
+                                                prop_alpha_all=prop_alpha_all,
+                                                prop_beta_all=prop_beta_all,
                                                 n_samples=n_samples,           # Correctly assign n_samples
                                                 kl_weight=kl_weight,
                                                 kl_p_weight=kl_p_weight,
@@ -335,15 +355,16 @@ def train_model(
                     _set_requires_grad(posterior_params, False)
                     _set_requires_grad(emission_params_optim, True)
                     active_params = emission_params_optim
-                    current_K = F.softplus(K_raw)
-                    current_pi = pi
+                    K_used = F.softplus(K_raw)
+                    pi_used = pi
                 else:
                     phase_optimizer = optimizer_inf
                     _set_requires_grad(posterior_params, True)
                     _set_requires_grad(emission_params_optim, False)
                     active_params = posterior_params
-                    current_K = F.softplus(K_raw).detach()
-                    current_pi = pi.detach() if pi is not None else None
+                    K_used = F.softplus(K_raw).detach()
+                    pi_used = pi.detach() if pi is not None else None
+
 
                 if phase_optimizer:
                     phase_optimizer.zero_grad()
@@ -354,10 +375,13 @@ def train_model(
                                                 posterior=posterior,
                                                 edge_tuple_to_index=edge_tuple_to_index,
                                                 g=g,
-                                                K=current_K,
+                                                K=K_used,
                                                 sigma2=sigma2,
-                                                pi=current_pi,                 # Correctly assign pi
+                                                pi=pi_used,                 # Correctly assign pi
                                                 belief_propagator=belief_propagator, # Correctly assign belief_propagator
+                                                prop_edge_probs_all=prop_edge_probs_all,
+                                                prop_alpha_all=prop_alpha_all,
+                                                prop_beta_all=prop_beta_all,
                                                 n_samples=n_samples,           # Correctly assign n_samples
                                                 kl_weight=kl_weight,
                                                 kl_p_weight=kl_p_weight,

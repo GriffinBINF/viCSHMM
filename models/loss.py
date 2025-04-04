@@ -9,50 +9,10 @@ from .posterior import TreeVariationalPosterior # For type hinting
 from .belief import BeliefPropagator # For type hinting
 # Assuming TrajectoryGraph might be needed for node_to_index etc.
 from .trajectory import TrajectoryGraph # For type hinting
+from .proposal import compute_proposal_distribution, compute_kl_beta
 
 # Assuming constants are available
 from utils.constants import EPSILON
-
-def compute_kl_beta(alpha_q, beta_q, alpha_p=1.0, beta_p=1.0, eps=EPSILON):
-    """
-    Computes KL( Beta(alpha_q, beta_q) || Beta(alpha_p, beta_p) ).
-    Handles tensor inputs and clamps for stability.
-    """
-    # Ensure target parameters are tensors with matching device/dtype
-    if not isinstance(alpha_p, torch.Tensor):
-        alpha_p = torch.tensor(alpha_p, device=alpha_q.device, dtype=alpha_q.dtype)
-    if not isinstance(beta_p, torch.Tensor):
-        beta_p = torch.tensor(beta_p, device=beta_q.device, dtype=beta_q.dtype)
-
-    # Clamp q parameters for stability before log/digamma
-    alpha_q = alpha_q.clamp(min=eps)
-    beta_q = beta_q.clamp(min=eps)
-
-    # Log gamma terms
-    lgamma_q_sum = torch.lgamma(alpha_q + beta_q)
-    lgamma_q_alpha = torch.lgamma(alpha_q)
-    lgamma_q_beta = torch.lgamma(beta_q)
-    lgamma_p_sum = torch.lgamma(alpha_p + beta_p)
-    lgamma_p_alpha = torch.lgamma(alpha_p)
-    lgamma_p_beta = torch.lgamma(beta_p)
-
-    # Digamma terms
-    digamma_q_alpha = torch.digamma(alpha_q)
-    digamma_q_beta = torch.digamma(beta_q)
-    digamma_q_sum = torch.digamma(alpha_q + beta_q)
-
-    # KL divergence formula components
-    term1 = lgamma_q_sum - lgamma_q_alpha - lgamma_q_beta
-    term2 = -lgamma_p_sum + lgamma_p_alpha + lgamma_p_beta
-    term3 = (alpha_q - alpha_p) * (digamma_q_alpha - digamma_q_sum)
-    term4 = (beta_q - beta_p) * (digamma_q_beta - digamma_q_sum)
-
-    kl_div = term1 + term2 + term3 + term4
-
-    # Handle potential NaNs/Infs arising from extreme parameter values after clamping
-    kl_div = torch.nan_to_num(kl_div, nan=0.0, posinf=1e6, neginf=-1e6) # Use 0 for NaN, large value for Inf
-    return kl_div.clamp(min=0) # KL should be non-negative
-
 
 def continuity_penalty(edge_idx, t, traj, index_to_edge_tuple, node_to_index):
     """
@@ -86,8 +46,6 @@ def continuity_penalty(edge_idx, t, traj, index_to_edge_tuple, node_to_index):
 
     return torch.stack(penalties).mean() if penalties else t.new_zeros(1).squeeze()
 
-
-
 def resolve_edge_nodes(edge_idx_tensor, index_to_edge_tuple_map, device=None):
     """Resolves edge indices to source (u) and target (v) node indices."""
     device = device or edge_idx_tensor.device
@@ -97,108 +55,6 @@ def resolve_edge_nodes(edge_idx_tensor, index_to_edge_tuple_map, device=None):
     v_idx = [index_to_edge_tuple_map[i][1] for i in edge_indices_list]
     return torch.tensor(u_idx, device=device, dtype=torch.long), \
            torch.tensor(v_idx, device=device, dtype=torch.long)
-
-def compute_proposal_distribution(
-    posterior: TreeVariationalPosterior,
-    belief_propagator: BeliefPropagator,
-    proposal_beta_const: float = 10.0,
-    proposal_target_temp: float = 1.0, # Temperature for broadening q(t|e_max)
-    eps: float = EPSILON
-):
-    """
-    Computes the parameters for the importance sampling proposal distribution
-    p_proposal(edge, t) = p_prop(edge) * p_prop(t | edge).
-
-    p_prop(edge) is based on diffused posterior edge probabilities.
-    p_prop(t | edge) = Beta(alpha_prop, beta_prop) depends on the relationship
-    between the proposed edge 'e' and the cell's current most likely edge 'e_max'.
-
-    Args:
-        posterior: The TreeVariationalPosterior module.
-        belief_propagator: The BeliefPropagator instance.
-        proposal_beta_const (float): Strength of the Beta distribution peak for
-                                     parent/child proposals (higher -> sharper peak).
-        proposal_target_temp (float): Temperature to broaden Beta distribution for
-                                       the target edge proposal (t > 1 widens).
-        eps (float): Small constant for numerical stability.
-
-    Returns:
-        tuple: Contains:
-            - prop_edge_probs (Tensor): Proposal edge probabilities [N_cells, N_edges].
-            - prop_alpha (Tensor): Proposal alpha parameters [N_cells, N_edges].
-            - prop_beta (Tensor): Proposal beta parameters [N_cells, N_edges].
-    """
-    device = posterior.device
-    n_cells = posterior.n_cells
-    n_edges = posterior.n_edges
-
-    with torch.no_grad(): # Calculations based on current q, don't track gradients here
-        # --- 1. Calculate Proposal Edge Probabilities ---
-        q_edge_probs = posterior.compute_edge_probs() # softmax(logits) [N, E]
-        # Use detached q_edge_probs as input to diffusion
-        prop_edge_probs = belief_propagator.diffuse(q_edge_probs.detach(), alpha=0.5, steps=2)
-        # Normalize just in case diffusion slightly changes sum
-        prop_edge_probs = prop_edge_probs / prop_edge_probs.sum(dim=1, keepdim=True).clamp(min=eps)
-
-        # --- 2. Find Target State (e_max, t_mean) for context ---
-        e_max_idx = q_edge_probs.argmax(dim=1) # [N] index of max prob edge per cell
-
-        # Get current q(t) parameters
-        alpha_q = posterior.alpha.detach()
-        beta_q = posterior.beta.detach()
-
-        # --- 3. Calculate Proposal Time Parameters (alpha_prop, beta_prop) ---
-        prop_alpha = torch.ones(n_cells, n_edges, device=device) # Default Beta(1,1)
-        prop_beta = torch.ones(n_cells, n_edges, device=device) # Default Beta(1,1)
-
-        # Precompute necessary maps from posterior/traj_graph
-        index_to_edge_tuple = posterior.index_to_edge # {edge_idx: (u_idx, v_idx)}
-        # Efficiently find children: Use precomputed children_map if available
-        children_map = posterior.children_map # {u_idx: [(u_idx, v_idx), ...]}
-        # Efficiently find parent: Create a parent_map (node_idx -> node_idx)
-        # This map relates NODES. We need to check edge relationships.
-        # Map: {end_node_idx_of_parent_edge : start_node_idx_of_parent_edge}
-        node_parent_map = {v_idx: u_idx for u_idx, v_idx in posterior.edge_list}
-
-        # Get edge indices list for easy iteration if needed
-        all_edge_indices = list(range(n_edges))
-
-        # Loop over cells to determine context-dependent proposal times
-        for i in range(n_cells):
-            current_e_max_idx = e_max_idx[i].item()
-            u_max, v_max = index_to_edge_tuple[current_e_max_idx]
-
-            # Iterate through all possible *proposal* edges 'e' for this cell
-            for e_prop_idx in all_edge_indices:
-                u_prop, v_prop = index_to_edge_tuple[e_prop_idx]
-
-                # Case 1: Proposal edge is the target edge
-                if e_prop_idx == current_e_max_idx:
-                    # Broaden the current q distribution slightly
-                    temp_alpha = alpha_q[i, e_prop_idx] / proposal_target_temp
-                    temp_beta = beta_q[i, e_prop_idx] / proposal_target_temp
-                    prop_alpha[i, e_prop_idx] = temp_alpha.clamp(min=eps)
-                    prop_beta[i, e_prop_idx] = temp_beta.clamp(min=eps)
-
-                # Case 2: Proposal edge is a child of the target edge
-                # Check if start node of proposal edge is the end node of target edge
-                elif u_prop == v_max:
-                    prop_alpha[i, e_prop_idx] = 1.0
-                    prop_beta[i, e_prop_idx] = proposal_beta_const
-
-                # Case 3: Proposal edge is a parent of the target edge
-                # Check if end node of proposal edge is the start node of target edge
-                elif v_prop == u_max:
-                    prop_alpha[i, e_prop_idx] = proposal_beta_const
-                    prop_beta[i, e_prop_idx] = 1.0
-
-                # Case 4: Distant edge (already covered by Beta(1,1) default)
-                else:
-                    # Default Beta(1,1) is already set
-                    pass
-
-    # Return parameters needed for sampling and log-prob calculation
-    return prop_edge_probs, prop_alpha, prop_beta
 
 def compute_elbo(
     # Core data and model components
@@ -214,6 +70,9 @@ def compute_elbo(
     # IS proposal hyperparameters (passed via kwargs or fixed)
     proposal_beta_const: float = 10.0,
     proposal_target_temp: float = 1.0,
+    prop_edge_probs_all=None,
+    prop_alpha_all=None,
+    prop_beta_all=None,
     # Optional weights for other terms (e.g., branch entropy)
     branch_entropy_weight=0.0, # Default to 0 unless explicitly used
     # -- Unused args from original signature (kept for compatibility) --
@@ -237,12 +96,10 @@ def compute_elbo(
     # --- (Re)compute Proposal Distribution Parameters for ALL cells ---
     # Inefficient: Ideally computed once per epoch outside this function.
     # Computing it here to satisfy the "don't change training loop" constraint.
-    prop_edge_probs_all, prop_alpha_all, prop_beta_all = compute_proposal_distribution(
-        posterior, belief_propagator,
-        proposal_beta_const=proposal_beta_const,
-        proposal_target_temp=proposal_target_temp,
-        eps=eps
-    )
+    if prop_edge_probs_all is None or prop_alpha_all is None or prop_beta_all is None:
+        raise ValueError("Proposal parameters must be precomputed and passed to compute_elbo")
+    assert prop_edge_probs_all.shape[0] == posterior.n_cells, "Mismatched proposal shape"
+
 
     # --- Get Parameters for the Current Batch ---
     # Proposal parameters for the batch
