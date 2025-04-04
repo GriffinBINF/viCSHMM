@@ -1,2 +1,0 @@
-EPSILON = 1e-6
-EPSILON_LOG = 1e-8
