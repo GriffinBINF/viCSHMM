@@ -18,7 +18,7 @@ def _set_requires_grad(params, value):
                  param.requires_grad_(value)
 
 def _log_stats(
-    epoch, avg_loss, metrics, elapsed, g, sigma2, K, pi=None,
+    epoch, avg_loss_epoch, metrics_avg_epoch, elapsed, g, sigma2, K, pi=None,
     training_mode="N/A", phase="N/A", tau=None,
     kl_weight=1.0, kl_p_weight=1.0, t_cont_weight=0.0, # t_cont_weight is unused but keep signature
     transition_weight=1.0, # transition_weight is unused but keep signature
@@ -27,7 +27,8 @@ def _log_stats(
     """Logs training statistics with both raw and weighted ELBO terms."""
     # Use the metrics dict from the *last batch* for components breakdown
     # avg_loss is the epoch average of the total loss
-    metrics_detached = {k: v.detach().item() if isinstance(v, torch.Tensor) and v.requires_grad else v for k, v in metrics.items()}
+    metrics_detached = metrics_avg_epoch  # These are already detached and float
+
 
     # --- Removed q_eff entropy calculation as q_eff is not returned ---
 
@@ -39,7 +40,7 @@ def _log_stats(
     log_str = (
         f"\n[Epoch {epoch}] Mode: {training_mode}" + (f" | Phase: {phase}" if phase != "N/A" else "") + "\n"
         # Report the averaged loss clearly
-        f"  Avg. Loss (-ELBO): {avg_loss:.4e}\n"
+        f"  Avg. Loss (-ELBO): {avg_loss_epoch:.4e}\n"
         # Components from the last batch's metrics dict:
         f"  NLL (IS):      {metrics_detached.get('nll_weighted', 0.0):.4e}\n"
         f"  {fmt_term('KL(t)', metrics_detached.get('kl_t', 0.0), kl_weight)}\n"
@@ -107,17 +108,15 @@ def train_model(
     sigma2_vals = []
     g_vals = []
     
-    for (u, v), idx in sorted(edge_to_index.items(), key=lambda x: x[1]):
-        
-        edge_index = edge_to_index[(u, v)]
-        params = traj_graph.emission_params.get(edge_index, None)
-
+    for edge_idx in range(posterior.n_edges):
+        u_idx, v_idx = posterior.index_to_edge[edge_idx]
+        params = traj_graph.emission_params.get(edge_idx, None)
         if params is None:
-            raise ValueError(f"Missing emission parameters for edge {(u, v)} in traj_graph.")
+            raise ValueError(f"Missing emission parameters for edge {edge_idx} ({u_idx}->{v_idx}) in traj_graph.")
         K_vals.append(params['K'])
         sigma2_vals.append(params['r2'])
-        # For g, average node expression at target node (v)
-        g_vals.append(traj_graph.node_emission.get(v, np.zeros(n_genes)))
+        g_vals.append(traj_graph.node_emission.get(v_idx, np.zeros(X.shape[1])))
+
     
     K_init = torch.tensor(np.stack(K_vals), dtype=torch.float32, device=X.device)
     # Derive K_raw from K_init using inverse softplus
@@ -217,7 +216,7 @@ def train_model(
             X_batch = X[cell_indices_batch].to(effective_device)
             batch_loss = 0.0
             K_used = F.softplus(K_raw)
-            pi_used = pi
+            pi_used = torch.sigmoid(pi) if use_pi and pi is not None else None
 
             if training_mode == 'joint':
                 freeze_posterior_now = epoch < freeze_posterior_epochs
@@ -315,7 +314,7 @@ def train_model(
                     for _ in range(inference_steps):
                         optimizer_inf.zero_grad()
                         K_used = F.softplus(K_raw).detach()
-                        pi_used = pi.detach() if pi is not None else None
+                        pi_used = torch.sigmoid(pi).detach() if pi is not None else None
 
                         loss, metrics = compute_elbo(
                                                 X=X_batch,                     # Use keyword args for clarity
@@ -359,14 +358,14 @@ def train_model(
                     _set_requires_grad(emission_params_optim, True)
                     active_params = emission_params_optim
                     K_used = F.softplus(K_raw)
-                    pi_used = pi
+                    pi_used = torch.sigmoid(pi) if pi is not None else None
                 else:
                     phase_optimizer = optimizer_inf
                     _set_requires_grad(posterior_params, True)
                     _set_requires_grad(emission_params_optim, False)
                     active_params = posterior_params
                     K_used = F.softplus(K_raw).detach()
-                    pi_used = pi.detach() if pi is not None else None
+                    pi_used = torch.sigmoid(pi) if pi is not None else None
 
 
                 if phase_optimizer:
@@ -405,7 +404,8 @@ def train_model(
                     batch_loss = loss.item()
                     last_batch_metrics = metrics
 
-            total_loss_accum += batch_loss
+            batch_size_actual = len(cell_indices_batch)
+            total_loss_accum += batch_loss * batch_size_actual
             for key in log_history.keys(): # Iterate over the NEW keys in log_history
              # Get value from the last batch's metrics for this key
                 val = last_batch_metrics.get(key, 0.0) # Default to 0.0 if key not present (e.g., 'loss')
@@ -423,8 +423,13 @@ def train_model(
                 log_history[key].append(averaged_metric)
 
         K_final_epoch = F.softplus(K_raw).detach()
+        avg_metrics_epoch = {
+        k: v / X.shape[0] if k != 'loss' else avg_loss_epoch
+        for k, v in epoch_metrics_agg.items()
+        }
+
         _log_stats(
-            epoch, avg_loss_epoch, epoch_metrics_agg, time.time() - start_time,
+            epoch, avg_loss_epoch, avg_metrics_epoch, time.time() - start_time,
             g, sigma2.detach(), K_final_epoch,
             pi.detach() if use_pi and pi is not None else None,
             training_mode=training_mode,
