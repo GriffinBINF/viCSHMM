@@ -28,7 +28,7 @@ class BeliefPropagator:
 
         return A
 
-    def diffuse(self, q_edge, alpha=0.2, steps=5):
+    def diffuse(self, q_edge, alpha=0.0, steps=10):
         """
         Diffuse edge-level probabilities q_edge: [N, E] using adjacency A.
         alpha: retention factor between original and diffused distribution.
