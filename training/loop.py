@@ -92,6 +92,10 @@ def train_model(
     tau_end=0.5,
     tau_anneal_mode='exponential',
     tau_anneal_rate=0.05,
+    # Proposal distribution hyperparameters
+    proposal_edge_temp=1.0,
+    proposal_diffusion_alpha=0.5,
+    proposal_diffusion_steps=2,
     # Other
     device=None,
     gradient_clip_norm=None
@@ -168,6 +172,8 @@ def train_model(
     print(f"Tau Annealing: {tau_anneal_mode}, Start: {tau_start:.2f}, End: {tau_end:.2f}, Rate: {tau_anneal_rate:.3f}")
     print(f"Optimizing K_raw (K > 0 via Softplus): {K_raw.requires_grad}")
     if use_pi and pi is not None: print(f"Optimizing pi: {pi.requires_grad}")
+    print(f"Proposal Edge Temp: {proposal_edge_temp}, Diffusion Alpha: {proposal_diffusion_alpha}, Steps: {proposal_diffusion_steps}")
+
     print(f"-------------------------")
 
     for epoch in range(num_epochs):
@@ -209,8 +215,12 @@ def train_model(
                 posterior,
                 belief_propagator,
                 proposal_beta_const=10.0,
-                proposal_target_temp=1.0
+                proposal_target_temp=1.0,
+                proposal_edge_temp=proposal_edge_temp,
+                diffusion_alpha=proposal_diffusion_alpha,
+                diffusion_steps=proposal_diffusion_steps
             )
+
 
         for batch_idx, cell_indices_batch in enumerate(batch_generator):
             X_batch = X[cell_indices_batch].to(effective_device)

@@ -9,7 +9,7 @@ class TrajectoryGraph:
         self.random_state = random_state
         self.laplace_h = laplace_h
         self.cluster_key = cluster_key
-
+        self.global_r2 = None # Will be initialized later
         self.G_traj = None
         self.levels = {}
         self.parent = {}
@@ -20,16 +20,113 @@ class TrajectoryGraph:
         self.normalizing_constants = {}
         self.emission_params = {}
         self.node_emission = {}
-        self.node_to_index = {}
         self.edge_list = []
         self.edge_segments = []
+        self.node_for_cluster = {}
+        self.cluster_for_node = {}
 
         self._initialize_graph()
-        self.index_to_node = {i: n for n, i in self.node_to_index.items()}
-        self.edge_tuple_to_index = {edge: i for i, edge in enumerate(self.edge_list)}
-
-        self._initialize_transition_probabilities()
         self._compute_edge_segments()
+
+    def get_roots(self):
+        return list(self.roots)
+
+    def refresh_structure_after_pruning(self):
+        """
+        Rebuild internal structures after pruning or modifying the trajectory graph.
+    
+        This method:
+        - Updates edge and node mappings
+        - Drops orphaned nodes
+        - Recomputes edge segments
+        - Realigns emission parameters
+        - Recomputes transition probabilities
+        """
+    
+        G = self.G_traj
+    
+        # --- Drop orphan nodes ---
+        orphan_nodes = [n for n in G.nodes() if G.in_degree(n) == 0 and G.out_degree(n) == 0]
+        G.remove_nodes_from(orphan_nodes)
+        # --- Recompute edge segments ---
+        self.edge_list = list(G.edges())
+        self._compute_edge_segments()
+    
+        # --- Realign or initialize emission parameters ---
+        valid_edges = set(self.edge_list)
+        self.emission_params = {
+            edge: self.emission_params.get(edge, {
+                "K": np.ones(self.adata.shape[1]),
+            }) for edge in valid_edges
+        }
+
+    
+        # --- Reset branch probabilities to 1.0 if missing ---
+        self.branch_probabilities = {
+            edge: self.branch_probabilities.get(edge, 1.0)
+            for edge in self.edge_list
+        }
+    
+        # --- Recompute transition probabilities ---
+        self.transition_probabilities.clear()
+        self.normalizing_constants.clear()
+        self._initialize_transition_probabilities()
+    
+        return
+
+    def log_branch_prior_for_edge(self, edge):
+        u_name = edge[0]
+        path = []
+        node = u_name
+        while True:
+            cluster = self.cluster_for_node.get(node)
+            parent = self.parent.get(cluster, None)
+            if parent is None:
+                break
+            parent_name = self.node_for_cluster.get(parent)
+            if parent_name is None:
+                break
+            path.append((parent_name, node))
+            node = parent_name
+
+        log_prob = 0.0
+        for e in reversed(path):
+            prob = self.branch_probabilities.get(e, 1e-6)
+            log_prob += np.log(max(prob, 1e-10))
+
+        return log_prob
+
+    def get_branch_paths_for_edges(self, edges=None):
+        if edges is None:
+            edges = self.edge_list
+
+        edge_to_path = {}
+        edge_log_priors = {}
+
+        for u_name, v_name in edges:
+            current = u_name
+            path = []
+            while True:
+                cluster = self.cluster_for_node.get(current)
+                parent_cluster = self.parent.get(cluster, None)
+                if parent_cluster is None:
+                    break
+                parent_name = self.node_for_cluster.get(parent_cluster)
+                if parent_name is None:
+                    break
+                path.insert(0, (parent_name, current))
+                current = parent_name
+
+            log_prob = 0.0
+            for edge in path + [(u_name, v_name)]:
+                prob = self.branch_probabilities.get(edge, 1e-6)
+                log_prob += np.log(max(prob, 1e-10))
+            
+            path.append((u_name, v_name))
+            edge_to_path[(u_name, v_name)] = path
+            edge_log_priors[(u_name, v_name)] = log_prob
+        
+        return edge_to_path, edge_log_priors
 
     def _initialize_graph(self):
         rng = np.random.default_rng(self.random_state)
@@ -70,13 +167,15 @@ class TrajectoryGraph:
                 for nb in chosen:
                     parent[nb] = cur
                     levels[nb] = lvl + 1
-                    queue.append((nb, lvl+1))
+                    queue.append((nb, lvl + 1))
                     children[nb] = []
 
         self.parent = parent
         self.levels = levels
         self.split_nodes = [c for c in children if len(children[c]) > 1]
+
         G_traj = nx.DiGraph()
+        self.roots = list(set(self.roots))
 
         def get_node_type(c):
             is_root = (parent[c] is None)
@@ -84,10 +183,10 @@ class TrajectoryGraph:
             node_kind = "split" if num_children > 1 else "leaf" if num_children == 0 else "int"
             return f"root_{node_kind}" if is_root else node_kind
 
-        node_for_cluster = {}
         for c in clusters:
             label = f"{get_node_type(c)}_{c}"
-            node_for_cluster[c] = label
+            self.node_for_cluster[c] = label
+            self.cluster_for_node[label] = c
             G_traj.add_node(label, type=get_node_type(c))
 
         comp_map = {cl: i for i, comp in enumerate(components) for cl in comp}
@@ -98,42 +197,60 @@ class TrajectoryGraph:
             root_label = f"RootNode_{comp_idx}_{count}"
             root_node_counter[comp_idx] = count + 1
             G_traj.add_node(root_label, type="root_node")
-            G_traj.add_edge(root_label, node_for_cluster[c], label=str(c))
+            G_traj.add_edge(root_label, self.node_for_cluster[c], label=str(c))
 
         for c in clusters:
             p = parent.get(c, None)
             if p is not None:
-                G_traj.add_edge(node_for_cluster[p], node_for_cluster[c], label=str(c))
+                G_traj.add_edge(self.node_for_cluster[p], self.node_for_cluster[c], label=str(c))
 
         self.G_traj = G_traj
-        self.node_to_index = {node: i for i, node in enumerate(G_traj.nodes())}
-        self.edge_list = [(self.node_to_index[u], self.node_to_index[v]) for u, v in G_traj.edges()]
+        self.edge_list = list(G_traj.edges())
         self.branch_probabilities = {e: 1.0 for e in self.edge_list}
 
         max_level = max(levels.values()) if levels else 1
         for node in G_traj.nodes():
-            cluster = node.split('_')[-1] if G_traj.nodes[node]['type'] != "root_node" else None
+            cluster = self.cluster_for_node.get(node, None)
             lvl = levels.get(cluster, 0) if cluster else 0
             G_traj.nodes[node]['t'] = lvl / max_level if max_level > 0 else 0.0
 
-    def _initialize_transition_probabilities(self):
+    def _initialize_transition_probabilities(self, cell_assignment=None):
+        """
+        Update transition probabilities based on:
+        - Emission t-values
+        - Observed cell flows
+        - Branch probabilities from get_branch_paths_for_edges
+        """
+    
+        self.transition_probabilities = {}
+        self.normalizing_constants = {}
+    
+        edge_counts = {e: 0 for e in self.edge_list}
+        if cell_assignment is not None:
+            for edge in cell_assignment['edge']:
+                edge_counts[edge] += 1
+    
         for u in self.G_traj.nodes():
-            t_u = self.G_traj.nodes[u].get('t', 0.0)
             children = list(self.G_traj.successors(u))
             if not children:
                 continue
-            weights = {v: 1.0 for v in children}
-            Z_u = (1 - t_u) + sum(weights.values())
-            self.normalizing_constants[u] = Z_u
+    
+            t_u = self.G_traj.nodes[u].get('t', 0.0)
+            # Default uniform edge weights
+            base_weights = {v: edge_counts.get((u, v), 1e-3) for v in children}
+    
+            Z = (1 - t_u) + sum(base_weights.values())  # Eq. 6 from paper
+    
             for v in children:
-                self.transition_probabilities[(u, v)] = weights[v] / Z_u
-                self.G_traj.edges[u, v]['A'] = self.transition_probabilities[(u, v)]
-                
+                prob = base_weights[v] / Z
+                self.transition_probabilities[(u, v)] = prob
+                self.G_traj.edges[u, v]['A'] = prob
+    
+            self.normalizing_constants[u] = Z
+
     def _compute_edge_segments(self):
         self.edge_segments = []
-        for u_idx, v_idx in self.edge_list:
-            u_name = self.index_to_node[u_idx]
-            v_name = self.index_to_node[v_idx]
+        for u_name, v_name in self.edge_list:
             t_u = self.G_traj.nodes[u_name].get('t', 0.0)
             t_v = self.G_traj.nodes[v_name].get('t', 1.0)
             self.edge_segments.append((min(t_u, t_v), max(t_u, t_v)))
@@ -144,7 +261,6 @@ class TrajectoryGraph:
             data['label']: (src, dst)
             for src, dst, data in self.G_traj.edges(data=True) if 'label' in data
         }
-
         assignments = pd.DataFrame(index=self.adata.obs_names)
         cluster_labels = self.adata.obs[self.cluster_key].astype(str)
         assignments['edge'] = cluster_labels.map(cluster_to_edge)
@@ -154,55 +270,91 @@ class TrajectoryGraph:
     def initialize_emission_parameters(self, cell_assignment):
         X = np.asarray(self.adata.X)
         cell_to_index = {cell: idx for idx, cell in enumerate(self.adata.obs_names)}
-
-        # For g: mean expression per node
-        node_expr = {self.node_to_index[node]: [] for node in self.G_traj.nodes()}
-
+    
+        weighted_sum = {node: np.zeros(X.shape[1]) for node in self.G_traj.nodes}
+        weight_total = {node: 0.0 for node in self.G_traj.nodes}
+    
         for edge in self.edge_list:
-            u_idx, v_idx = edge
-            df = cell_assignment[cell_assignment['edge'] == (self.index_to_node[u_idx], self.index_to_node[v_idx])]
+            u_name, v_name = edge
+            df = cell_assignment[cell_assignment['edge'] == edge]
+    
             for cell in df.index:
-                expr = X[cell_to_index[cell]]
-                node_expr[u_idx].append(expr)
-                node_expr[v_idx].append(expr)
-
-
+                t_i = df.loc[cell, 'latent_time']
+                expr_i = X[cell_to_index[cell]]
+    
+                # Soft assignment weights with K = 1
+                w_u = 1 - t_i
+                w_v = t_i
+    
+                weighted_sum[u_name] += w_u * expr_i
+                weight_total[u_name] += w_u
+    
+                weighted_sum[v_name] += w_v * expr_i
+                weight_total[v_name] += w_v
+    
         self.node_emission = {
-            node: np.mean(expr_list, axis=0) if expr_list else np.zeros(X.shape[1])
-            for node, expr_list in node_expr.items()
+            node: (weighted_sum[node] / weight_total[node]) if weight_total[node] > 0 else np.zeros(X.shape[1])
+            for node in self.G_traj.nodes
         }
-
-        # For emission params
+        
+        # --- Initialize per-edge K to ones ---
+        n_genes = X.shape[1]
         for edge in self.edge_list:
+             self.emission_params[edge] = {'K': np.ones(n_genes)}
+        
+        # --- Calculate initial global r2 ---
+        all_residuals_sq = []
+        for edge in self.edge_list:
+            u_name, v_name = edge
             df = cell_assignment[cell_assignment['edge'] == edge]
             if df.empty:
-                var_expr = np.ones(X.shape[1])
-                pi_val = np.zeros(X.shape[1])
-            else:
-                expr_edge = np.array([X[cell_to_index[cell]] for cell in df.index])
-                var_expr = np.var(expr_edge, axis=0)
-                pi_val = np.mean(expr_edge == 0, axis=0)
-            K = np.ones_like(var_expr)
-            edge_idx = self.edge_tuple_to_index[edge]
-            self.emission_params[edge_idx] = {
-                'K': K,
-                'r2': var_expr,
-                'pi': pi_val
-            }
+                continue
+        
+            # Use initialized node emissions and K=1 for initial r2
+            g_a = self.node_emission[u_name]
+            g_b = self.node_emission[v_name]
+            # K_init = self.emission_params[edge]['K'] # K is just ones here
+            K_init = np.ones(n_genes)
+        
+            for cell in df.index:
+                t = df.at[cell, 'latent_time']
+                x_i = X[cell_to_index[cell]]
+                # Use exponential model consistent with EMTrainer (even with K=1)
+                w_u = np.exp(-K_init * t)
+                w_v = 1.0 - w_u
+                f_t = g_a * w_u + g_b * w_v # Equivalent form
+                # f_t = g_b + (g_a - g_b) * np.exp(-K_init * t) # Alternative form
+        
+                all_residuals_sq.append((x_i - f_t) ** 2)
+        
+        if not all_residuals_sq:
+            print("[WARN] No cells assigned initially? Setting initial global r2 to ones.")
+            self.global_r2 = np.ones(n_genes)
+        else:
+            all_residuals_sq = np.stack(all_residuals_sq, axis=0)
+            self.global_r2 = np.mean(all_residuals_sq, axis=0)
+            self.global_r2 = np.clip(self.global_r2, 1e-4, np.inf) # Apply floor
+        
+        # Return emission_params (which now only contains K per edge)
         return self.emission_params
 
     def plot_cells_on_trajectory(self, cell_assignment, **kwargs):
-        # Convert edge indices back to node names for plotting
         plot_df = cell_assignment.copy()
-
         plot_cells_on_trajectory(self.G_traj, plot_df, self.adata, branch_probs=self.branch_probabilities, **kwargs)
 
 def initialize_trajectory(adata, random_state=None, debug=False):
     traj_graph = TrajectoryGraph(adata, random_state=random_state or np.random.randint(0, 2**32 - 1))
+    # --- Step 1: Get initial assignments ---
     cell_assignment = traj_graph.assign_cells_to_paths(random_state=42)
+    # --- Step 2: Initialize emissions (g, K=1) and global r2 ---
     traj_graph.initialize_emission_parameters(cell_assignment)
+    # --- Step 3: Initialize transition probabilities (A) based on initial assignments ---
+    traj_graph._initialize_transition_probabilities(cell_assignment) # <-- ADD THIS LINE
+
     if debug:
         print("Trajectory graph nodes:", list(traj_graph.G_traj.nodes()))
         print("Trajectory graph edges:", list(traj_graph.G_traj.edges()))
+        print("Initial Global r2 (sample):", traj_graph.global_r2[:5])
+        print("Initial Transition Probs (sample):", list(traj_graph.transition_probabilities.items())[:5])
         print("\nSample cell assignments (index-based):\n", cell_assignment.head())
     return traj_graph, cell_assignment

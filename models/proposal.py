@@ -48,6 +48,9 @@ def compute_proposal_distribution(
     belief_propagator: BeliefPropagator,
     proposal_beta_const: float = 10.0,
     proposal_target_temp: float = 1.0,
+    proposal_edge_temp: float = 1.0,
+    diffusion_alpha: float = 0.5,
+    diffusion_steps: int = 2,
     eps: float = EPSILON
 ):
     """
@@ -66,8 +69,9 @@ def compute_proposal_distribution(
 
     with torch.no_grad():
         # --- 1. Proposal edge probabilities ---
-        q_edge_probs = posterior.compute_edge_probs()  # [N, E]
-        prop_edge_probs = belief_propagator.diffuse(q_edge_probs.detach(), alpha=0.5, steps=2)
+        edge_logits = posterior.edge_logits.detach() / proposal_edge_temp
+        q_edge_probs = torch.nn.functional.softmax(edge_logits, dim=1)
+        prop_edge_probs = belief_propagator.diffuse(q_edge_probs, alpha=diffusion_alpha, steps=diffusion_steps)
         prop_edge_probs = prop_edge_probs / prop_edge_probs.sum(dim=1, keepdim=True).clamp(min=eps)
 
         # --- 2. Extract target edge per cell ---

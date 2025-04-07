@@ -133,7 +133,7 @@ def plot_cells_on_trajectory(
     for cell_id, row in assignments.iterrows():
         edge = row['edge']
         latent_time = row['latent_time']
-        if edge:
+        if edge and edge[0] in pos and edge[1] in pos:
             P0, P1 = pos[edge[0]], pos[edge[1]]
             cp1, cp2 = compute_bezier_control_points(P0, P1, curve_amount)
             pt = cubic_bezier(P0, cp1, cp2, P1, np.array([latent_time]))[0]
