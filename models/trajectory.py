@@ -4,7 +4,7 @@ import networkx as nx
 from viz.trajectory import plot_cells_on_trajectory
 
 class TrajectoryGraph:
-    def __init__(self, adata, cluster_key='leiden', random_state=0, laplace_h=1.0):
+    def __init__(self, adata, cluster_key='leiden', random_state=0, laplace_h=1.0, root_cluster=None, topology_config=None):
         self.adata = adata
         self.random_state = random_state
         self.laplace_h = laplace_h
@@ -25,6 +25,9 @@ class TrajectoryGraph:
         self.node_for_cluster = {}
         self.cluster_for_node = {}
 
+        
+        self.root_cluster = root_cluster
+        self.topology_config = topology_config
         self._initialize_graph()
         self._compute_edge_segments()
 
@@ -130,89 +133,139 @@ class TrajectoryGraph:
 
     def _initialize_graph(self):
         rng = np.random.default_rng(self.random_state)
-        conn = self.adata.uns['paga']['connectivities']
-        clusters = sorted(self.adata.obs[self.cluster_key].unique(), key=int)
-
+        clusters = list(pd.Categorical(self.adata.obs[self.cluster_key]).categories)
+        cluster_set = set(clusters)
+    
+        self.G_traj = nx.DiGraph()
         G_conn = nx.Graph()
-        for i, c1 in enumerate(clusters):
-            for j, c2 in enumerate(clusters):
-                w = conn[i, j]
-                if w > 0:
-                    G_conn.add_edge(c1, c2, weight=w)
-
-        components = list(nx.connected_components(G_conn))
-        parent = {}
-        levels = {}
-        children = {}
-
-        for comp in components:
-            comp = list(comp)
-            root_cluster = rng.choice(comp)
-            self.roots.append(root_cluster)
-            queue = [(root_cluster, 0)]
-            parent[root_cluster] = None
-            levels[root_cluster] = 0
-            children[root_cluster] = []
-
+    
+        self.node_for_cluster.clear()
+        self.cluster_for_node.clear()
+        self.roots = []
+        self.edge_list = []
+        self.parent = {}
+        self.levels = {}
+    
+        if self.topology_config is not None:
+            # --- Manual topology config ---
+            parents = {}
+            children = {}
+            for p, c in self.topology_config:
+                if p not in cluster_set or c not in cluster_set:
+                    raise ValueError(f"Invalid cluster in topology config: ({p}, {c})")
+                G_conn.add_edge(p, c, weight=1.0)
+                parents[c] = p
+                children.setdefault(p, []).append(c)
+                children.setdefault(c, [])
+    
+            root_candidates = [c for c in cluster_set if c not in parents]
+            if not root_candidates:
+                raise ValueError("No root clusters found in topology config.")
+            self.roots = root_candidates
+            self.parent = parents
+    
+            # Level computation
+            self.levels = {}
+            queue = [(r, 0) for r in self.roots]
+            for r in self.roots:
+                self.parent[r] = None
             while queue:
                 cur, lvl = queue.pop(0)
-                neigh = [n for n in G_conn.neighbors(cur) if n not in parent]
-                if not neigh:
-                    continue
-                weights = np.array([G_conn[cur][n]['weight'] for n in neigh])
-                probs = weights / weights.sum()
-                num_children = min(2, len(neigh))
-                chosen = rng.choice(neigh, size=num_children, replace=False, p=probs)
-                children[cur] = list(chosen)
-                for nb in chosen:
-                    parent[nb] = cur
-                    levels[nb] = lvl + 1
-                    queue.append((nb, lvl + 1))
-                    children[nb] = []
+                self.levels[cur] = lvl
+                for child in children.get(cur, []):
+                    queue.append((child, lvl + 1))
+    
+        else:
+            # --- Automatic initialization from PAGA ---
+            conn = self.adata.uns['paga']['connectivities']
+            paga_clusters = list(pd.Categorical(self.adata.obs[self.cluster_key]).categories)
+            cluster_to_idx = {k: i for i, k in enumerate(paga_clusters)}
+            
+            G_conn = nx.Graph()
+            for c1 in clusters:
+                for c2 in clusters:
+                    if c1 not in cluster_to_idx or c2 not in cluster_to_idx:
+                        continue
+                    i, j = cluster_to_idx[c1], cluster_to_idx[c2]
+                    w = conn[i, j]
+                    if w > 0:
+                        G_conn.add_edge(c1, c2, weight=w)
 
-        self.parent = parent
-        self.levels = levels
-        self.split_nodes = [c for c in children if len(children[c]) > 1]
-
-        G_traj = nx.DiGraph()
-        self.roots = list(set(self.roots))
-
+    
+            components = list(nx.connected_components(G_conn))
+            parent = {}
+            levels = {}
+            children = {}
+    
+            for comp in components:
+                comp = list(map(str, comp))
+                
+                if self.root_cluster is not None and str(self.root_cluster) in comp:
+                    root_cluster = str(self.root_cluster)
+                else:
+                    root_cluster = rng.choice(comp)
+                
+                self.roots.append(root_cluster)
+                queue = [(root_cluster, 0)]
+                parent[root_cluster] = None
+                levels[root_cluster] = 0
+                children[root_cluster] = []
+    
+                while queue:
+                    cur, lvl = queue.pop(0)
+                    neigh = [n for n in G_conn.neighbors(cur) if n not in parent]
+                    if not neigh:
+                        continue
+                    weights = np.array([G_conn[cur][n]['weight'] for n in neigh])
+                    probs = weights / weights.sum()
+                    num_children = min(2, len(neigh))
+                    chosen = rng.choice(neigh, size=num_children, replace=False, p=probs)
+                    children[cur] = list(chosen)
+                    for nb in chosen:
+                        parent[nb] = cur
+                        levels[nb] = lvl + 1
+                        queue.append((nb, lvl + 1))
+                        children[nb] = []
+    
+            self.parent = parent
+            self.levels = levels
+            self.split_nodes = [c for c in children if len(children[c]) > 1]
+    
+        # --- Construct trajectory graph ---
         def get_node_type(c):
-            is_root = (parent[c] is None)
-            num_children = len(children[c])
+            is_root = (self.parent[c] is None)
+            num_children = sum(1 for k, v in self.parent.items() if v == c)
             node_kind = "split" if num_children > 1 else "leaf" if num_children == 0 else "int"
             return f"root_{node_kind}" if is_root else node_kind
-
+    
         for c in clusters:
-            label = f"{get_node_type(c)}_{c}"
+            label = f"{get_node_type(c)}__CL__{c}"
             self.node_for_cluster[c] = label
             self.cluster_for_node[label] = c
-            G_traj.add_node(label, type=get_node_type(c))
-
-        comp_map = {cl: i for i, comp in enumerate(components) for cl in comp}
-        root_node_counter = {}
+            self.G_traj.add_node(label, type=get_node_type(c))
+    
+        for c in clusters:
+            p = self.parent.get(c, None)
+            if p is not None:
+                self.G_traj.add_edge(self.node_for_cluster[p], self.node_for_cluster[c], label=str(c))
+    
+        # Add synthetic root nodes
+        comp_map = {cl: i for i, cl in enumerate(self.roots)}
         for c in self.roots:
             comp_idx = comp_map[c]
-            count = root_node_counter.get(comp_idx, 0)
-            root_label = f"RootNode_{comp_idx}_{count}"
-            root_node_counter[comp_idx] = count + 1
-            G_traj.add_node(root_label, type="root_node")
-            G_traj.add_edge(root_label, self.node_for_cluster[c], label=str(c))
-
-        for c in clusters:
-            p = parent.get(c, None)
-            if p is not None:
-                G_traj.add_edge(self.node_for_cluster[p], self.node_for_cluster[c], label=str(c))
-
-        self.G_traj = G_traj
-        self.edge_list = list(G_traj.edges())
+            root_label = f"RootNode_{comp_idx}"
+            self.G_traj.add_node(root_label, type="root_node")
+            self.G_traj.add_edge(root_label, self.node_for_cluster[c], label=str(c))
+    
+        self.edge_list = list(self.G_traj.edges())
         self.branch_probabilities = {e: 1.0 for e in self.edge_list}
-
-        max_level = max(levels.values()) if levels else 1
-        for node in G_traj.nodes():
+    
+        max_level = max(self.levels.values()) if self.levels else 1
+        for node in self.G_traj.nodes():
             cluster = self.cluster_for_node.get(node, None)
-            lvl = levels.get(cluster, 0) if cluster else 0
-            G_traj.nodes[node]['t'] = lvl / max_level if max_level > 0 else 0.0
+            lvl = self.levels.get(cluster, 0) if cluster else 0
+            self.G_traj.nodes[node]['t'] = lvl / max_level if max_level > 0 else 0.0
+
 
     def _initialize_transition_probabilities(self, cell_assignment=None):
         """
@@ -263,12 +316,22 @@ class TrajectoryGraph:
         }
         assignments = pd.DataFrame(index=self.adata.obs_names)
         cluster_labels = self.adata.obs[self.cluster_key].astype(str)
+    
+        # ✅ FIXED: assign edge column BEFORE checking for NaNs
         assignments['edge'] = cluster_labels.map(cluster_to_edge)
+    
+        # Sanity check
+        missing = assignments['edge'].isna()
+        if missing.any():
+            unknown = cluster_labels[missing].unique()
+            raise ValueError(f"Unmapped clusters in assignment: {unknown.tolist()}")
+    
         assignments['latent_time'] = rng.random(size=self.adata.n_obs)
         return assignments
 
+
     def initialize_emission_parameters(self, cell_assignment):
-        X = np.asarray(self.adata.X)
+        X = self.adata.X
         cell_to_index = {cell: idx for idx, cell in enumerate(self.adata.obs_names)}
     
         weighted_sum = {node: np.zeros(X.shape[1]) for node in self.G_traj.nodes}
@@ -280,12 +343,10 @@ class TrajectoryGraph:
     
             for cell in df.index:
                 t_i = df.loc[cell, 'latent_time']
-                expr_i = X[cell_to_index[cell]]
-    
-                # Soft assignment weights with K = 1
+                expr_i = np.asarray(X[cell_to_index[cell]]).flatten()
                 w_u = 1 - t_i
                 w_v = t_i
-    
+                
                 weighted_sum[u_name] += w_u * expr_i
                 weight_total[u_name] += w_u
     
@@ -317,15 +378,15 @@ class TrajectoryGraph:
             K_init = np.ones(n_genes)
         
             for cell in df.index:
-                t = df.at[cell, 'latent_time']
-                x_i = X[cell_to_index[cell]]
+                t_i = df.loc[cell, 'latent_time']
+                expr_i = np.asarray(X[cell_to_index[cell]]).flatten()
                 # Use exponential model consistent with EMTrainer (even with K=1)
-                w_u = np.exp(-K_init * t)
+                w_u = np.exp(-K_init * t_i)
                 w_v = 1.0 - w_u
                 f_t = g_a * w_u + g_b * w_v # Equivalent form
                 # f_t = g_b + (g_a - g_b) * np.exp(-K_init * t) # Alternative form
         
-                all_residuals_sq.append((x_i - f_t) ** 2)
+                all_residuals_sq.append((expr_i - f_t) ** 2)
         
         if not all_residuals_sq:
             print("[WARN] No cells assigned initially? Setting initial global r2 to ones.")
@@ -342,14 +403,26 @@ class TrajectoryGraph:
         plot_df = cell_assignment.copy()
         plot_cells_on_trajectory(self.G_traj, plot_df, self.adata, branch_probs=self.branch_probabilities, **kwargs)
 
-def initialize_trajectory(adata, random_state=None, debug=False):
-    traj_graph = TrajectoryGraph(adata, random_state=random_state or np.random.randint(0, 2**32 - 1))
+def initialize_trajectory(adata, random_state=None, cluster_key='leiden', root_cluster=None, topology_config=None, debug=False):
+    traj_graph = TrajectoryGraph(
+        adata, 
+        cluster_key=cluster_key, 
+        random_state=random_state or np.random.randint(0, 2**32 - 1),
+        root_cluster=root_cluster,
+        topology_config=topology_config
+    )
+    if hasattr(adata.X, "toarray"):
+        adata.X = adata.X.toarray()
+    elif hasattr(adata.X, "A"):
+        adata.X = adata.X.A
+    else:
+        adata.X = np.asarray(adata.X)
     # --- Step 1: Get initial assignments ---
     cell_assignment = traj_graph.assign_cells_to_paths(random_state=42)
     # --- Step 2: Initialize emissions (g, K=1) and global r2 ---
     traj_graph.initialize_emission_parameters(cell_assignment)
     # --- Step 3: Initialize transition probabilities (A) based on initial assignments ---
-    traj_graph._initialize_transition_probabilities(cell_assignment) # <-- ADD THIS LINE
+    traj_graph._initialize_transition_probabilities(cell_assignment)
 
     if debug:
         print("Trajectory graph nodes:", list(traj_graph.G_traj.nodes()))
@@ -358,3 +431,4 @@ def initialize_trajectory(adata, random_state=None, debug=False):
         print("Initial Transition Probs (sample):", list(traj_graph.transition_probabilities.items())[:5])
         print("\nSample cell assignments (index-based):\n", cell_assignment.head())
     return traj_graph, cell_assignment
+    
